@@ -1,9 +1,18 @@
+export interface Vr360Metadata {
+  isVr360: boolean;
+  projection: 'none' | 'equirectangular' | 'hequirectangular' | 'cubemap' | 'fisheye';
+  stereoMode: 'mono' | 'sbs' | 'tb';
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
+}
+
 export interface VideoMetadata {
   width: number;
   height: number;
   rawWidth?: number;
   rawHeight?: number;
   sourceRotation?: number;
+  vr360?: Vr360Metadata;
   codec: string;
   codecLong: string;
   profile: string;
@@ -39,6 +48,28 @@ export interface WatermarkBox {
   confidence?: number;
 }
 
+export interface SceneTag {
+  id: string;
+  label: string;
+  category?: 'scene' | 'highlight' | 'b-roll' | 'cut' | 'note';
+  color: string;
+  timestamp: number;
+  notes?: string;
+}
+
+export interface TimelineClip {
+  id: string;
+  name: string;
+  /** Source media in-point in seconds */
+  sourceStart: number;
+  /** Source media out-point in seconds */
+  sourceEnd: number;
+  /** Position on the horizontal timeline track in seconds */
+  trackStart: number;
+  color: string;
+  tags: SceneTag[];
+}
+
 export interface UpscaleConfig {
   presetId: string;
   width: number;
@@ -49,11 +80,28 @@ export interface UpscaleConfig {
   watermarkEnabled: boolean;
   watermarkMode: 'delogo' | 'blur';
   watermarkBoxes: WatermarkBox[];
+  vrNormalizeEnabled: boolean;
+  vrInputProjection: 'e' | 'hequirect' | 'dfisheye' | 'fisheye' | 'cubemap';
+  vrStereoMode: 'mono' | 'sbs' | 'tb';
+  vrFov: number;
+  vrYaw: number;
+  vrPitch: number;
+  vrRoll: number;
   aspectMode: 'fit' | 'pad' | 'crop' | 'stretch';
   scaleAlgorithm: 'lanczos' | 'bicubic' | 'spline' | 'bilinear' | 'neighbor';
   sharpenPreset: 'none' | 'light' | 'medium' | 'strong' | 'custom';
   sharpenAmount: number;
-  denoise: 'none' | 'light' | 'medium';
+  denoise: 'none' | 'light' | 'medium' | 'nlmeans';
+  // Video Enhancement & Color Grading Controls
+  enhancePreset: 'none' | 'cinema' | 'vivid' | 'restore' | 'lowlight' | 'custom';
+  casStrength: number; // 0..1 Contrast Adaptive Sharpening
+  debandEnabled: boolean;
+  deinterlaceEnabled: boolean;
+  brightness: number; // -0.5 .. 0.5 (default 0)
+  contrast: number; // 0.5 .. 1.8 (default 1)
+  saturation: number; // 0 .. 2.5 (default 1)
+  gamma: number; // 0.5 .. 2.0 (default 1)
+  vibrance: number; // -1.0 .. 1.5 (default 0)
   codec: 'libx264' | 'libx265' | 'h264_videotoolbox' | 'hevc_videotoolbox' | 'libsvtav1' | 'libvpx-vp9';
   rateControl: 'crf' | 'bitrate';
   crf: number;

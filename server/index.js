@@ -217,12 +217,128 @@ function probeVideo(filePath) {
           const effectiveW = isRotatedSideways ? rawH : rawW;
           const effectiveH = isRotatedSideways ? rawW : rawH;
 
+          // Detect VR / 360° Spherical & Stereoscopic 3D Metadata + Aspect Ratio Heuristics
+          const sideDataList = Array.isArray(videoStream.side_data_list)
+            ? videoStream.side_data_list
+            : [];
+          const streamTags = { ...(format.tags || {}), ...(videoStream.tags || {}) };
+          const tagString = JSON.stringify(streamTags).toLowerCase();
+          const fileBaseName = path.basename(filePath).toLowerCase();
+
+          let isVr360 = false;
+          let projection = 'none';
+          let stereoMode = 'mono';
+          let confidence = 'low';
+          const reasons = [];
+
+          // 1. Check FFprobe Spherical Mapping side_data
+          const sphericalSd = sideDataList.find(
+            (sd) =>
+              (sd.side_data_type && sd.side_data_type.toLowerCase().includes('spherical')) ||
+              sd.projection !== undefined
+          );
+          if (sphericalSd) {
+            isVr360 = true;
+            confidence = 'high';
+            const projRaw = String(sphericalSd.projection || 'equirectangular').toLowerCase();
+            if (projRaw.includes('cubemap')) projection = 'cubemap';
+            else if (projRaw.includes('half') || projRaw.includes('tilted'))
+              projection = 'hequirectangular';
+            else projection = 'equirectangular';
+            reasons.push(`Spherical metadata (${sphericalSd.projection || 'equirectangular'})`);
+          }
+
+          // 2. Check FFprobe Stereo3D side_data or Matroska/MP4 stereo_mode tags
+          const stereoSd = sideDataList.find(
+            (sd) =>
+              (sd.side_data_type && sd.side_data_type.toLowerCase().includes('stereo')) ||
+              sd.type === 'side by side' ||
+              sd.type === 'top and bottom'
+          );
+          if (stereoSd) {
+            isVr360 = true;
+            confidence = 'high';
+            const stType = String(stereoSd.type || '').toLowerCase();
+            if (stType.includes('side')) stereoMode = 'sbs';
+            else if (stType.includes('top') || stType.includes('bottom')) stereoMode = 'tb';
+            reasons.push(`Stereo3D metadata (${stereoSd.type})`);
+          }
+
+          // 3. Check container/stream tags & filename markers (GSpherical, ProjectionType, VR180, 360, SBS, TB)
+          if (
+            tagString.includes('spherical') ||
+            tagString.includes('equirectangular') ||
+            fileBaseName.includes('360') ||
+            fileBaseName.includes('vr180') ||
+            fileBaseName.includes('_vr')
+          ) {
+            isVr360 = true;
+            if (confidence === 'low') confidence = 'high';
+            if (projection === 'none') {
+              projection = fileBaseName.includes('180') ? 'hequirectangular' : 'equirectangular';
+            }
+            reasons.push('VR/360 stream tag or filename signature');
+          }
+
+          if (
+            tagString.includes('side_by_side') ||
+            tagString.includes('left_right') ||
+            fileBaseName.includes('sbs') ||
+            fileBaseName.includes('lr')
+          ) {
+            stereoMode = 'sbs';
+          } else if (
+            tagString.includes('top_bottom') ||
+            fileBaseName.includes('_tb') ||
+            fileBaseName.includes('ou')
+          ) {
+            stereoMode = 'tb';
+          }
+
+          // 4. Aspect Ratio Heuristics:
+          // - Exact 2:1 (e.g. 3840x1920, 4096x2048, 5760x2880, 7680x3840) is standard 360° Equirectangular (or VR180 SBS)
+          // - Exact 1:1 (e.g. 2048x2048, 3840x3840, 4096x4096) is standard 360° Top-Bottom Stereo
+          // - Exact 32:9 (e.g. 3840x1080) is Full SBS 3D
+          if (effectiveW > 0 && effectiveH > 0) {
+            const ar = effectiveW / effectiveH;
+            if (Math.abs(ar - 2.0) < 0.02) {
+              isVr360 = true;
+              if (projection === 'none') projection = 'equirectangular';
+              if (confidence === 'low') confidence = 'medium';
+              reasons.push(`2:1 Equirectangular aspect ratio (${effectiveW}×${effectiveH})`);
+            } else if (Math.abs(ar - 1.0) < 0.02 && effectiveW >= 1920) {
+              isVr360 = true;
+              if (projection === 'none') projection = 'equirectangular';
+              if (stereoMode === 'mono') stereoMode = 'tb';
+              if (confidence === 'low') confidence = 'medium';
+              reasons.push(`1:1 Top-Bottom 360° Stereo aspect ratio (${effectiveW}×${effectiveH})`);
+            } else if (Math.abs(ar - 32 / 9) < 0.03) {
+              isVr360 = true;
+              if (stereoMode === 'mono') stereoMode = 'sbs';
+              if (projection === 'none') projection = 'hequirectangular';
+              if (confidence === 'low') confidence = 'medium';
+              reasons.push(`32:9 Side-by-Side Stereo aspect ratio (${effectiveW}×${effectiveH})`);
+            }
+          }
+
+          const vr360 = {
+            isVr360,
+            projection,
+            stereoMode,
+            confidence,
+            reason:
+              reasons.length > 0
+                ? reasons.join(' • ')
+                : 'Standard flat rectilinear video stream',
+          };
+
           resolve({
             width: effectiveW,
             height: effectiveH,
             rawWidth: rawW,
             rawHeight: rawH,
             sourceRotation,
+            vr360,
             codec: videoStream.codec_name || 'unknown',
             codecLong: videoStream.codec_long_name || '',
             profile: videoStream.profile || '',
@@ -426,39 +542,75 @@ async function detectWatermarksInVideo(filePath, metadata) {
 }
 
 /**
- * Build FFmpeg arguments & CLI preview string from user configuration
+ * Build the -vf video filter array for both full rendering and live single-frame preview
  */
-function buildFfmpegArgs(inputPath, outputPath, config, sourceMeta = null) {
+function buildVfFilterList(config = {}, sourceMeta = null, options = { previewCapWidth: 0 }) {
   const {
     width = 1920,
     height = 1080,
-    rotation = 0, // 0, 90, 180, 270
+    rotation = 0,
     flipHorizontal = false,
     flipVertical = false,
     watermarkEnabled = false,
-    watermarkMode = 'delogo', // 'delogo' | 'blur'
+    watermarkMode = 'delogo',
     watermarkBoxes = [],
-    aspectMode = 'fit', // 'fit' (maintain aspect ratio), 'pad' (letterbox/pillarbox), 'crop' (fill & center crop), 'stretch' (exact WxH)
-    scaleAlgorithm = 'lanczos', // 'lanczos', 'bicubic', 'spline', 'bilinear', 'neighbor'
-    sharpenPreset = 'none', // 'none', 'light', 'medium', 'strong', 'custom'
-    sharpenAmount = 0.8, // 0.1 to 2.5
-    denoise = 'none', // 'none', 'light', 'medium'
-    codec = 'libx264', // 'libx264', 'libx265', 'h264_videotoolbox', 'hevc_videotoolbox', 'libsvtav1', 'libvpx-vp9'
-    rateControl = 'crf', // 'crf' | 'bitrate'
-    crf = 18, // 0 - 51
-    targetBitrateMbps = 16, // Mbps
-    preset = 'medium', // ultrafast, superfast, veryfast, faster, fast, medium, slow, slower
-    fps = 'source', // 'source', '24', '30', '60', '120'
-    pixelFormat = 'yuv420p', // 'yuv420p', 'yuv420p10le'
-    audioMode = 'copy', // 'copy', 'aac_192', 'aac_320', 'mute'
-    container = 'mp4', // 'mp4', 'mov', 'mkv', 'webm'
+    vrNormalizeEnabled = false,
+    vrInputProjection = 'e',
+    vrStereoMode = 'mono',
+    vrFov = 95,
+    vrYaw = 0,
+    vrPitch = 0,
+    vrRoll = 0,
+    aspectMode = 'fit',
+    scaleAlgorithm = 'lanczos',
+    sharpenPreset = 'none',
+    sharpenAmount = 0.8,
+    denoise = 'none',
+    casStrength = 0,
+    debandEnabled = false,
+    deinterlaceEnabled = false,
+    brightness = 0,
+    contrast = 1,
+    saturation = 1,
+    gamma = 1,
+    vibrance = 0,
   } = config;
 
-  const targetW = toEven(width);
-  const targetH = toEven(height);
-  const flags = `flags=${scaleAlgorithm}+accurate_rnd+full_chroma_int`;
+  let targetW = toEven(width);
+  let targetH = toEven(height);
 
+  // When rendering a fast live preview frame, cap the preview bounding box so 4K/7200px renders in <80ms
+  // while preserving the exact target aspect ratio and filter chain!
+  if (options.previewCapWidth && targetW > options.previewCapWidth) {
+    const ratio = options.previewCapWidth / targetW;
+    targetW = toEven(options.previewCapWidth);
+    targetH = toEven(targetH * ratio);
+  }
+
+  const flags = `flags=${scaleAlgorithm}+accurate_rnd+full_chroma_int`;
   const vfFilters = [];
+
+  // 0. VR / 360° & Stereo3D Normalization (unwraps spherical 360°/180° & extracts 2D eye view into standard flat rectilinear video)
+  if (vrNormalizeEnabled) {
+    if (vrStereoMode === 'sbs') {
+      vfFilters.push('crop=iw/2:ih:0:0');
+    } else if (vrStereoMode === 'tb') {
+      vfFilters.push('crop=iw:ih/2:0:0');
+    }
+
+    const inProj = vrInputProjection || 'e';
+    const hFov = Math.max(40, Math.min(150, Number(vrFov) || 95));
+    const vFov = Math.max(25, Math.min(120, Math.round(hFov * (targetH / targetW))));
+    const yaw = Math.max(-180, Math.min(180, Number(vrYaw) || 0));
+    const pitch = Math.max(-90, Math.min(90, Number(vrPitch) || 0));
+    const roll = Math.max(-180, Math.min(180, Number(vrRoll) || 0));
+
+    vfFilters.push(
+      `v360=input=${inProj}:output=flat:h_fov=${hFov}:v_fov=${vFov}:yaw=${yaw}:pitch=${pitch}:roll=${roll}:w=${targetW}:h=${targetH}:interp=${
+        options.previewCapWidth ? 'linear' : 'lanczos'
+      }`
+    );
+  }
 
   // 0a. Watermark / Logo Removal (applied on the original source frame before rotation & upscaling)
   if (watermarkEnabled && Array.isArray(watermarkBoxes) && watermarkBoxes.length > 0) {
@@ -466,7 +618,6 @@ function buildFfmpegArgs(inputPath, outputPath, config, sourceMeta = null) {
     const srcH = Number(sourceMeta?.height || config?.sourceHeight) || 1080;
 
     for (const box of watermarkBoxes) {
-      // Clamp box inside [2 .. srcW-4] and [2 .. srcH-4] as required by FFmpeg delogo filter
       const rawX = Math.round((Number(box.xPct) || 0) * srcW);
       const rawY = Math.round((Number(box.yPct) || 0) * srcH);
       const rawW = Math.round((Number(box.wPct) || 0.15) * srcW);
@@ -477,8 +628,6 @@ function buildFfmpegArgs(inputPath, outputPath, config, sourceMeta = null) {
       const w = Math.max(8, Math.min(srcW - x - 2, rawW));
       const h = Math.max(8, Math.min(srcH - y - 2, rawH));
 
-      // Both delogo and soft-inpaint modes use FFmpeg's spatial boundary interpolation delogo filter
-      // (blur mode applies a double-smoothed delogo pass for heavier opaque badges)
       vfFilters.push(`delogo=x=${x}:y=${y}:w=${w}:h=${h}:show=0`);
       if (watermarkMode === 'blur') {
         const innerX = Math.max(2, x + 2);
@@ -493,11 +642,11 @@ function buildFfmpegArgs(inputPath, outputPath, config, sourceMeta = null) {
   // 0b. Rotation & Flip filters (applied before scaling to target frame)
   const rot = Number(rotation) || 0;
   if (rot === 90) {
-    vfFilters.push('transpose=1'); // 90° Clockwise
+    vfFilters.push('transpose=1');
   } else if (rot === 180) {
-    vfFilters.push('hflip', 'vflip'); // 180°
+    vfFilters.push('hflip', 'vflip');
   } else if (rot === 270) {
-    vfFilters.push('transpose=2'); // 90° Counter-Clockwise (270° CW)
+    vfFilters.push('transpose=2');
   }
 
   if (flipHorizontal) {
@@ -507,37 +656,47 @@ function buildFfmpegArgs(inputPath, outputPath, config, sourceMeta = null) {
     vfFilters.push('vflip');
   }
 
-  // 1. Optional pre-denoise filter before upscaling
+  // 1. Optional Deinterlacing (bwdif) & Pre-Denoise filter before upscaling
+  if (deinterlaceEnabled) {
+    vfFilters.push('bwdif=mode=send_frame:parity=auto:deint=all');
+  }
+
   if (denoise === 'light') {
     vfFilters.push('hqdn3d=1.5:1.5:3:3');
   } else if (denoise === 'medium') {
     vfFilters.push('hqdn3d=3:3:6:6');
+  } else if (denoise === 'nlmeans') {
+    // Non-local means denoiser (use fast atadenoise in live preview for instant response)
+    vfFilters.push(options.previewCapWidth ? 'hqdn3d=2.5:2.5:4:4' : 'nlmeans=s=2.0:p=5:r=9');
   }
 
-  // 2. Resolution scaling & aspect mode
-  // Note: because rotation (transpose) runs BEFORE scale in vfFilters,
-  // `iw` and `ih` here are already the post-rotation input width and height!
-  if (aspectMode === 'stretch') {
-    vfFilters.push(`scale=${targetW}:${targetH}:${flags}`, 'setsar=1');
-  } else if (aspectMode === 'pad') {
-    vfFilters.push(
-      `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease:${flags}`,
-      `pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`,
-      'setsar=1'
-    );
-  } else if (aspectMode === 'crop') {
-    vfFilters.push(
-      `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase:${flags}`,
-      `crop=${targetW}:${targetH}`,
-      'setsar=1'
-    );
-  } else {
-    // 'fit': scale up OR down to fit within targetW x targetH while preserving post-rotation aspect ratio
-    vfFilters.push(
-      `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease:${flags}`,
-      'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-      'setsar=1'
-    );
+  if (debandEnabled) {
+    vfFilters.push('deband');
+  }
+
+  // 2. Resolution scaling & aspect mode (skip if v360 already scaled to targetW x targetH)
+  if (!vrNormalizeEnabled) {
+    if (aspectMode === 'stretch') {
+      vfFilters.push(`scale=${targetW}:${targetH}:${flags}`, 'setsar=1');
+    } else if (aspectMode === 'pad') {
+      vfFilters.push(
+        `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease:${flags}`,
+        `pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black`,
+        'setsar=1'
+      );
+    } else if (aspectMode === 'crop') {
+      vfFilters.push(
+        `scale=${targetW}:${targetH}:force_original_aspect_ratio=increase:${flags}`,
+        `crop=${targetW}:${targetH}`,
+        'setsar=1'
+      );
+    } else {
+      vfFilters.push(
+        `scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease:${flags}`,
+        'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        'setsar=1'
+      );
+    }
   }
 
   // 3. Unsharp mask / detail enhancement for upscaled video
@@ -546,10 +705,62 @@ function buildFfmpegArgs(inputPath, outputPath, config, sourceMeta = null) {
     if (sharpenPreset === 'light') lumaAmount = 0.5;
     else if (sharpenPreset === 'medium') lumaAmount = 1.0;
     else if (sharpenPreset === 'strong') lumaAmount = 1.6;
-    else if (sharpenPreset === 'custom') lumaAmount = Math.max(0.1, Math.min(3.0, Number(sharpenAmount) || 0.8));
+    else if (sharpenPreset === 'custom')
+      lumaAmount = Math.max(0.1, Math.min(3.0, Number(sharpenAmount) || 0.8));
 
     vfFilters.push(`unsharp=5:5:${lumaAmount.toFixed(2)}:5:5:0.0`);
   }
+
+  // 4. Contrast Adaptive Sharpening (CAS)
+  const casVal = Math.max(0, Math.min(1, Number(casStrength) || 0));
+  if (casVal > 0.01) {
+    vfFilters.push(`cas=${casVal.toFixed(2)}`);
+  }
+
+  // 5. Color Grading & Tone Enhancement (eq & vibrance)
+  const bVal = Number(brightness) || 0;
+  const cVal = Number(contrast) ?? 1;
+  const sVal = Number(saturation) ?? 1;
+  const gVal = Number(gamma) ?? 1;
+  const vVal = Number(vibrance) || 0;
+
+  if (
+    Math.abs(bVal) > 0.01 ||
+    Math.abs(cVal - 1) > 0.01 ||
+    Math.abs(sVal - 1) > 0.01 ||
+    Math.abs(gVal - 1) > 0.01
+  ) {
+    vfFilters.push(
+      `eq=brightness=${bVal.toFixed(2)}:contrast=${cVal.toFixed(2)}:saturation=${sVal.toFixed(
+        2
+      )}:gamma=${gVal.toFixed(2)}`
+    );
+  }
+
+  if (Math.abs(vVal) > 0.01) {
+    vfFilters.push(`vibrance=intensity=${vVal.toFixed(2)}`);
+  }
+
+  return vfFilters;
+}
+
+/**
+ * Build FFmpeg arguments & CLI preview string from user configuration
+ */
+function buildFfmpegArgs(inputPath, outputPath, config, sourceMeta = null) {
+  const {
+    codec = 'libx264', // 'libx264', 'libx265', 'h264_videotoolbox', 'hevc_videotoolbox', 'libsvtav1', 'libvpx-vp9'
+    rateControl = 'crf', // 'crf' | 'bitrate'
+    crf = 18, // 0 - 51
+    targetBitrateMbps = 16, // Mbps
+    preset = 'medium', // ultrafast, superfast, veryfast, faster, fast, medium, slow, slower
+    fps = 'source', // 'source', '24', '30', '60', '120'
+    pixelFormat = 'yuv420p', // 'yuv420p', 'yuv420p10le'
+    audioMode = 'copy', // 'copy', 'aac_192', 'aac_320', 'mute'
+    container = 'mp4', // 'mp4', 'mov', 'mkv', 'webm'
+  } = config;
+
+  const vfFilters = buildVfFilterList(config, sourceMeta, { previewCapWidth: 0 });
 
   const args = ['-y', '-hide_banner', '-i', inputPath];
 
@@ -788,6 +999,86 @@ app.post('/api/generate-sample', async (req, res) => {
       res.status(500).json({ error: probeErr.message });
     }
   });
+});
+
+/**
+ * POST /api/live-preview-frame
+ * Extracts and filters a single JPEG frame at `timestamp` through the exact active FFmpeg `-vf` filtergraph
+ * (`v360`, `delogo`, `transpose`, `hqdn3d`, `scale`, `pad`/`crop`, `unsharp`) and returns it directly as `image/jpeg`.
+ */
+let activePreviewProc = null;
+app.post('/api/live-preview-frame', async (req, res) => {
+  try {
+    const { fileId, timestamp = 0, config = {}, sourceMeta = null } = req.body || {};
+    if (!fileId) {
+      return res.status(400).json({ error: 'fileId is required' });
+    }
+
+    const inputPath = path.join(UPLOADS_DIR, path.basename(fileId));
+    if (!fs.existsSync(inputPath)) {
+      return res.status(404).json({ error: 'Source video file not found' });
+    }
+
+    // Kill any superseded in-flight preview process so rapid slider dragging stays instant
+    if (activePreviewProc) {
+      try {
+        activePreviewProc.kill('SIGKILL');
+      } catch (_e) {
+        // ignore
+      }
+      activePreviewProc = null;
+    }
+
+    const meta = sourceMeta || (await probeVideo(inputPath));
+    const vfFilters = buildVfFilterList(config, meta, { previewCapWidth: 1280 });
+    const seekSec = Math.max(0, Number(timestamp) || 0).toFixed(3);
+
+    const args = [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-ss',
+      seekSec,
+      '-i',
+      inputPath,
+      ...(vfFilters.length > 0 ? ['-vf', vfFilters.join(',')] : []),
+      '-frames:v',
+      '1',
+      '-q:v',
+      '3',
+      '-f',
+      'image2',
+      '-c:v',
+      'mjpeg',
+      'pipe:1',
+    ];
+
+    const child = spawn('ffmpeg', args);
+    activePreviewProc = child;
+
+    const chunks = [];
+    child.stdout.on('data', (c) => chunks.push(c));
+    child.on('error', (err) => {
+      if (activePreviewProc === child) activePreviewProc = null;
+      if (!res.headersSent) res.status(500).json({ error: err.message });
+    });
+    child.on('close', (code) => {
+      if (activePreviewProc === child) activePreviewProc = null;
+      if (res.headersSent) return;
+      const buf = Buffer.concat(chunks);
+      if (code === 0 && buf.length > 0) {
+        res.setHeader('Content-Type', 'image/jpeg');
+        res.setHeader('Cache-Control', 'no-store');
+        res.send(buf);
+      } else {
+        res.status(500).json({ error: 'Failed to render live preview frame' });
+      }
+    });
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message || 'Live preview error' });
+    }
+  }
 });
 
 /**

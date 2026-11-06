@@ -4,7 +4,6 @@ import {
   Sparkles,
   Sliders,
   Cpu,
-  Film,
   Download,
   Terminal,
   CheckCircle2,
@@ -25,9 +24,22 @@ import {
   Eraser,
   ScanSearch,
   Trash2,
+  Globe,
+  Compass,
+  Film,
+  ChevronDown,
+  ChevronUp,
+  SunMedium,
 } from 'lucide-react';
-import { ResolutionPreset, UploadedVideo, UpscaleConfig, JobState, WatermarkBox } from './types';
+import {
+  ResolutionPreset,
+  UploadedVideo,
+  UpscaleConfig,
+  JobState,
+  WatermarkBox,
+} from './types';
 import { VideoComparePlayer } from './components/VideoComparePlayer';
+import { VideoTimelineEditor } from './components/VideoTimelineEditor';
 import { getBrowserFingerprint } from './utils/fingerprint';
 
 const RESOLUTION_PRESETS: ResolutionPreset[] = [
@@ -37,52 +49,52 @@ const RESOLUTION_PRESETS: ResolutionPreset[] = [
     badge: 'HD',
     width: 1280,
     height: 720,
-    desc: 'Standard High Definition (1280×720)',
+    desc: '1280×720',
     recommendedBitrateMbps: 6,
   },
   {
     id: '1080p',
-    label: '1080p Full HD',
+    label: '1080p FHD',
     badge: 'FHD',
     width: 1920,
     height: 1080,
-    desc: 'Crisp Full HD 16:9 (1920×1080)',
+    desc: '1920×1080',
     recommendedBitrateMbps: 12,
   },
   {
     id: '2k',
-    label: '2K QHD (1440p)',
+    label: '2K QHD',
     badge: '2K',
     width: 2560,
     height: 1440,
-    desc: 'Quad HD Studio Master (2560×1440)',
+    desc: '2560×1440',
     recommendedBitrateMbps: 24,
   },
   {
     id: '4k',
-    label: '4K Ultra HD',
-    badge: '4K UHD',
+    label: '4K UHD',
+    badge: '4K',
     width: 3840,
     height: 2160,
-    desc: 'Cinema 4K UHD (3840×2160)',
+    desc: '3840×2160',
     recommendedBitrateMbps: 45,
   },
   {
     id: '7200w',
-    label: '7200px Ultra-Wide / 8K Class',
-    badge: '7200px',
+    label: '7200px 8K',
+    badge: '7200p',
     width: 7200,
     height: 4050,
-    desc: 'Extreme 7200×4050 Super-Resolution Frame',
+    desc: '7200×4050',
     recommendedBitrateMbps: 85,
   },
   {
     id: 'custom',
-    label: 'Custom Dimensions',
+    label: 'Custom',
     badge: 'W×H',
     width: 1920,
     height: 1080,
-    desc: 'Specify exact frame width & height',
+    desc: 'Custom W×H',
     recommendedBitrateMbps: 16,
   },
 ];
@@ -110,6 +122,8 @@ function toEven(n: number): number {
   return v % 2 === 0 ? v : v + 1;
 }
 
+type InspectorTab = 'geometry' | 'enhance' | 'cleanup' | 'export';
+
 export default function App() {
   const [systemInfo, setSystemInfo] = useState<{
     available: boolean;
@@ -119,9 +133,21 @@ export default function App() {
   const [fingerprint, setFingerprint] = useState<string>('');
 
   const [video, setVideo] = useState<UploadedVideo | null>(null);
+  const [playheadTime, setPlayheadTime] = useState<number>(0);
+  const [seekTarget, setSeekTarget] = useState<number | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isDetectingWatermark, setIsDetectingWatermark] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+
+  // Studio Workspace UI States
+  const [activeTab, setActiveTab] = useState<InspectorTab>('geometry');
+  const [showTimelineDrawer, setShowTimelineDrawer] = useState<boolean>(true);
+  const [showCliDrawer, setShowCliDrawer] = useState<boolean>(false);
+
+  // Real-Time Live FFmpeg Frame Preview State
+  const [livePreviewEnabled, setLivePreviewEnabled] = useState<boolean>(true);
+  const [livePreviewUrl, setLivePreviewUrl] = useState<string | null>(null);
+  const [isLivePreviewLoading, setIsLivePreviewLoading] = useState<boolean>(false);
 
   const [config, setConfig] = useState<UpscaleConfig>({
     presetId: '1080p',
@@ -133,11 +159,27 @@ export default function App() {
     watermarkEnabled: false,
     watermarkMode: 'delogo',
     watermarkBoxes: [],
+    vrNormalizeEnabled: false,
+    vrInputProjection: 'e',
+    vrStereoMode: 'mono',
+    vrFov: 95,
+    vrYaw: 0,
+    vrPitch: 0,
+    vrRoll: 0,
     aspectMode: 'fit',
     scaleAlgorithm: 'lanczos',
     sharpenPreset: 'medium',
     sharpenAmount: 1.0,
     denoise: 'none',
+    enhancePreset: 'none',
+    casStrength: 0,
+    debandEnabled: false,
+    deinterlaceEnabled: false,
+    brightness: 0,
+    contrast: 1,
+    saturation: 1,
+    gamma: 1,
+    vibrance: 0,
     codec: 'libx264',
     rateControl: 'crf',
     crf: 18,
@@ -155,7 +197,6 @@ export default function App() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Fetch FFmpeg capabilities & initialize Browser Fingerprint on mount
   useEffect(() => {
     getBrowserFingerprint().then((fp) => setFingerprint(fp));
     fetch('/api/system-info')
@@ -164,7 +205,7 @@ export default function App() {
       .catch(() => setSystemInfo({ available: false }));
   }, []);
 
-  // Update live FFmpeg CLI preview whenever config or video changes
+  // Update live FFmpeg CLI preview
   useEffect(() => {
     fetch('/api/preview-command', {
       method: 'POST',
@@ -182,6 +223,81 @@ export default function App() {
       .catch(() => {});
   }, [config, video]);
 
+  // Real-time debounced FFmpeg live frame preview whenever filter settings or playhead changes
+  useEffect(() => {
+    if (!video || !livePreviewEnabled || job?.outputUrl) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      setIsLivePreviewLoading(true);
+      try {
+        const res = await fetch('/api/live-preview-frame', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            fileId: video.fileId,
+            timestamp: playheadTime,
+            config,
+            sourceMeta: video.metadata,
+          }),
+        });
+        if (res.ok) {
+          const blob = await res.blob();
+          const nextUrl = URL.createObjectURL(blob);
+          setLivePreviewUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev);
+            return nextUrl;
+          });
+        }
+      } catch (_e) {
+        // ignore aborted preview requests
+      } finally {
+        setIsLivePreviewLoading(false);
+      }
+    }, 180);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    video?.fileId,
+    livePreviewEnabled,
+    job?.outputUrl,
+    playheadTime,
+    config.width,
+    config.height,
+    config.rotation,
+    config.flipHorizontal,
+    config.flipVertical,
+    config.aspectMode,
+    config.scaleAlgorithm,
+    config.sharpenPreset,
+    config.sharpenAmount,
+    config.denoise,
+    config.casStrength,
+    config.debandEnabled,
+    config.deinterlaceEnabled,
+    config.brightness,
+    config.contrast,
+    config.saturation,
+    config.gamma,
+    config.vibrance,
+    config.watermarkEnabled,
+    config.watermarkMode,
+    config.watermarkBoxes,
+    config.vrNormalizeEnabled,
+    config.vrInputProjection,
+    config.vrStereoMode,
+    config.vrFov,
+    config.vrYaw,
+    config.vrPitch,
+    config.vrRoll,
+  ]);
+
   // Poll active FFmpeg job progress
   useEffect(() => {
     if (!job || job.status !== 'processing') return;
@@ -197,7 +313,7 @@ export default function App() {
           }
         }
       } catch (_err) {
-        // ignore transient poll error
+        // ignore
       }
     }, 500);
 
@@ -206,13 +322,12 @@ export default function App() {
 
   const handleSelectPreset = (preset: ResolutionPreset) => {
     setConfig((prev) => {
-      // Determine whether the post-rotation video is portrait
       const srcW = video?.metadata.width || 1920;
       const srcH = video?.metadata.height || 1080;
       const isRotatedSideways = prev.rotation === 90 || prev.rotation === 270;
       const effectiveSrcW = isRotatedSideways ? srcH : srcW;
       const effectiveSrcH = isRotatedSideways ? srcW : srcH;
-      const isPortrait = effectiveSrcH > effectiveSrcW;
+      const isPortrait = effectiveSrcH > effectiveSrcW && !prev.vrNormalizeEnabled;
 
       const baseW = preset.id === 'custom' ? prev.width : preset.width;
       const baseH = preset.id === 'custom' ? prev.height : preset.height;
@@ -224,7 +339,6 @@ export default function App() {
         width: nextW,
         height: nextH,
         targetBitrateMbps: preset.recommendedBitrateMbps,
-        // Automatically switch to VideoToolbox or libx265 if user picks 7200px because H.264 max width is 4096px
         codec:
           Math.max(nextW, nextH) > 4096 &&
           (prev.codec === 'libx264' || prev.codec === 'h264_videotoolbox')
@@ -248,6 +362,80 @@ export default function App() {
     });
   };
 
+  const applyEnhancePreset = (
+    preset: UpscaleConfig['enhancePreset']
+  ) => {
+    if (preset === 'none') {
+      setConfig((prev) => ({
+        ...prev,
+        enhancePreset: 'none',
+        sharpenPreset: 'none',
+        denoise: 'none',
+        casStrength: 0,
+        debandEnabled: false,
+        brightness: 0,
+        contrast: 1,
+        saturation: 1,
+        gamma: 1,
+        vibrance: 0,
+      }));
+    } else if (preset === 'cinema') {
+      setConfig((prev) => ({
+        ...prev,
+        enhancePreset: 'cinema',
+        sharpenPreset: 'light',
+        casStrength: 0.45,
+        debandEnabled: true,
+        brightness: 0.0,
+        contrast: 1.12,
+        saturation: 1.08,
+        gamma: 0.96,
+        vibrance: 0.25,
+      }));
+    } else if (preset === 'vivid') {
+      setConfig((prev) => ({
+        ...prev,
+        enhancePreset: 'vivid',
+        sharpenPreset: 'medium',
+        casStrength: 0.6,
+        debandEnabled: false,
+        brightness: 0.02,
+        contrast: 1.16,
+        saturation: 1.28,
+        gamma: 1.0,
+        vibrance: 0.45,
+      }));
+    } else if (preset === 'restore') {
+      setConfig((prev) => ({
+        ...prev,
+        enhancePreset: 'restore',
+        sharpenPreset: 'strong',
+        denoise: 'medium',
+        casStrength: 0.7,
+        debandEnabled: true,
+        brightness: 0.02,
+        contrast: 1.1,
+        saturation: 1.05,
+        gamma: 1.02,
+        vibrance: 0.15,
+      }));
+    } else if (preset === 'lowlight') {
+      setConfig((prev) => ({
+        ...prev,
+        enhancePreset: 'lowlight',
+        sharpenPreset: 'light',
+        denoise: 'medium',
+        casStrength: 0.35,
+        debandEnabled: true,
+        brightness: 0.08,
+        contrast: 1.08,
+        saturation: 1.1,
+        gamma: 1.28,
+        vibrance: 0.2,
+      }));
+    }
+  };
+
   const handleFileUpload = async (file: File) => {
     setIsUploading(true);
     setUploadError(null);
@@ -265,33 +453,48 @@ export default function App() {
 
       const res = await fetch('/api/upload', {
         method: 'POST',
-        headers: {
-          'x-browser-fingerprint': fp,
-        },
+        headers: { 'x-browser-fingerprint': fp },
         body: formData,
       });
       const data: UploadedVideo = await res.json();
       if (!res.ok) throw new Error((data as any).error || 'Upload failed');
       setVideo(data);
-      // Reset input value so selecting the same filename again still triggers onChange
+      setPlayheadTime(0);
       if (fileInputRef.current) fileInputRef.current.value = '';
 
-      // Auto-orient target preset dimensions to match uploaded video's orientation (portrait vs landscape)
       if (data.metadata.width && data.metadata.height) {
         const isSourcePortrait = data.metadata.height > data.metadata.width;
+        const vrInfo = data.metadata.vr360;
+        const detectedProj =
+          vrInfo?.projection === 'hequirectangular'
+            ? 'hequirect'
+            : vrInfo?.projection === 'cubemap'
+            ? 'cubemap'
+            : vrInfo?.projection === 'fisheye'
+            ? 'fisheye'
+            : 'e';
+        const detectedStereo = vrInfo?.stereoMode || 'mono';
+
         setConfig((prev) => {
           const isTargetPortrait = prev.height > prev.width;
-          if (isSourcePortrait !== isTargetPortrait) {
-            return {
-              ...prev,
-              rotation: 0,
-              watermarkBoxes: [],
-              width: prev.height,
-              height: prev.width,
-            };
-          }
-          return { ...prev, rotation: 0, watermarkBoxes: [] };
+          return {
+            ...prev,
+            rotation: 0,
+            watermarkBoxes: [],
+            vrNormalizeEnabled: Boolean(vrInfo?.isVr360),
+            vrInputProjection: detectedProj,
+            vrStereoMode: detectedStereo,
+            vrYaw: 0,
+            vrPitch: 0,
+            vrRoll: 0,
+            width: isSourcePortrait !== isTargetPortrait ? prev.height : prev.width,
+            height: isSourcePortrait !== isTargetPortrait ? prev.width : prev.height,
+          };
         });
+
+        if (vrInfo?.isVr360) {
+          setActiveTab('cleanup');
+        }
       }
     } catch (err: any) {
       setUploadError(err.message || 'Failed to upload video');
@@ -325,36 +528,6 @@ export default function App() {
     }
   };
 
-  const handleAddCornerWatermarkPreset = (
-    corner: 'bottom-right' | 'top-right' | 'bottom-left' | 'top-left'
-  ) => {
-    const presets: Record<
-      typeof corner,
-      { label: string; xPct: number; yPct: number; wPct: number; hPct: number }
-    > = {
-      'bottom-right': { label: 'Bottom-Right', xPct: 0.76, yPct: 0.82, wPct: 0.21, hPct: 0.13 },
-      'top-right': { label: 'Top-Right', xPct: 0.76, yPct: 0.05, wPct: 0.21, hPct: 0.13 },
-      'bottom-left': { label: 'Bottom-Left', xPct: 0.03, yPct: 0.82, wPct: 0.21, hPct: 0.13 },
-      'top-left': { label: 'Top-Left', xPct: 0.03, yPct: 0.05, wPct: 0.21, hPct: 0.13 },
-    };
-    const p = presets[corner];
-    setConfig((prev) => ({
-      ...prev,
-      watermarkEnabled: true,
-      watermarkBoxes: [
-        ...prev.watermarkBoxes,
-        {
-          id: `wm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          label: p.label,
-          xPct: p.xPct,
-          yPct: p.yPct,
-          wPct: p.wPct,
-          hPct: p.hPct,
-        },
-      ],
-    }));
-  };
-
   const handleGenerateSample = async () => {
     setIsUploading(true);
     setUploadError(null);
@@ -378,6 +551,7 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to generate sample video');
       setVideo(data);
+      setPlayheadTime(0);
     } catch (err: any) {
       setUploadError(err.message || 'Failed to generate sample video');
     } finally {
@@ -458,7 +632,13 @@ export default function App() {
 
   let effectiveOutW = targetBoxW;
   let effectiveOutH = targetBoxH;
-  if (video && config.aspectMode === 'fit' && rotatedSourceW > 0 && rotatedSourceH > 0) {
+  if (
+    video &&
+    config.aspectMode === 'fit' &&
+    !config.vrNormalizeEnabled &&
+    rotatedSourceW > 0 &&
+    rotatedSourceH > 0
+  ) {
     const ratio = Math.min(targetBoxW / rotatedSourceW, targetBoxH / rotatedSourceH);
     effectiveOutW = toEven(rotatedSourceW * ratio);
     effectiveOutH = toEven(rotatedSourceH * ratio);
@@ -469,66 +649,121 @@ export default function App() {
     video && rotatedSourceH > 0 ? (effectiveOutH / rotatedSourceH).toFixed(2) : null;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
-      {/* Header */}
-      <header className="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md sticky top-0 z-30">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3.5 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-lg shadow-indigo-500/25">
-              <Sparkles className="w-5 h-5 text-white" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-lg font-bold tracking-tight text-white">
-                  FrameScale Studio
-                </h1>
-                <span className="px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                  FFmpeg Engine
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Upscale & transcode video frames to 720p, 1080p, 2K, 4K & 7200px with MP4 / HEVC / Apple VideoToolbox codecs
-              </p>
-            </div>
+    <div className="min-h-screen bg-[#090b10] text-slate-100 flex flex-col">
+      {/* Sleek Studio Top Bar (DaVinci / CapCut Pro Inspired) */}
+      <header className="h-14 border-b border-slate-800/80 bg-[#0d1117]/90 backdrop-blur-md sticky top-0 z-30 px-4 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-md shadow-indigo-500/20 shrink-0">
+            <Sparkles className="w-4 h-4 text-white" />
           </div>
+          <span className="text-sm font-bold tracking-tight text-white shrink-0">
+            FrameScale Studio
+          </span>
 
-          <div className="flex items-center gap-3">
-            {fingerprint && (
-              <div
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700/80 text-slate-300 text-xs font-mono"
-                title={`Browser Session Fingerprint: ${fingerprint} (isolates your uploads & output files)`}
-              >
-                <Fingerprint className="w-3.5 h-3.5 text-indigo-400" />
-                <span>ID: {fingerprint.slice(0, 8)}</span>
-              </div>
-            )}
-            {systemInfo?.available ? (
-              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs">
-                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                <span className="font-mono truncate max-w-[260px]" title={systemInfo.version}>
-                  {systemInfo.version?.split('Copyright')[0] || 'FFmpeg Ready'}
+          {video && (
+            <>
+              <span className="text-slate-700">/</span>
+              <div className="flex items-center gap-2 min-w-0">
+                <FileVideo className="w-4 h-4 text-indigo-400 shrink-0" />
+                <span className="text-xs font-medium text-slate-200 truncate max-w-[200px] sm:max-w-[300px]">
+                  {video.originalName}
                 </span>
-                {systemInfo.capabilities?.hasVideoToolbox && (
-                  <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-[10px] font-semibold">
-                    Apple GPU
+                <span className="hidden md:inline-block px-2 py-0.5 rounded bg-slate-800/90 text-[11px] font-mono text-slate-300">
+                  {video.metadata.width}×{video.metadata.height} • {video.metadata.fps}fps •{' '}
+                  {formatBytes(video.metadata.sizeBytes)}
+                </span>
+                {video.metadata.vr360?.isVr360 && (
+                  <span
+                    className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 flex items-center gap-1 shrink-0"
+                    title={video.metadata.vr360.reason}
+                  >
+                    <Globe className="w-3 h-3" />
+                    360° VR
                   </span>
                 )}
               </div>
-            ) : (
-              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs">
-                <AlertCircle className="w-4 h-4" />
-                <span>Checking FFmpeg backend...</span>
-              </div>
-            )}
-          </div>
+            </>
+          )}
+        </div>
+
+        {/* Right Top Toolbar Actions */}
+        <div className="flex items-center gap-2">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="video/*"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) handleFileUpload(f);
+            }}
+          />
+
+          {video && (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowTimelineDrawer((s) => !s)}
+                className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1.5 transition cursor-pointer ${
+                  showTimelineDrawer
+                    ? 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300'
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Film className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Timeline</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setShowCliDrawer((s) => !s)}
+                className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1.5 transition cursor-pointer ${
+                  showCliDrawer
+                    ? 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300'
+                    : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+                title="View generated FFmpeg CLI command"
+              >
+                <Terminal className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">CLI</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 border border-slate-700 transition cursor-pointer"
+              >
+                Replace Video
+              </button>
+            </>
+          )}
+
+          {fingerprint && (
+            <div
+              className="hidden lg:flex items-center gap-1 px-2 py-1 rounded-md bg-slate-900 border border-slate-800 text-slate-400 text-[11px] font-mono"
+              title={`Session Fingerprint: ${fingerprint}`}
+            >
+              <Fingerprint className="w-3 h-3 text-indigo-400" />
+              <span>{fingerprint.slice(0, 6)}</span>
+            </div>
+          )}
+
+          {systemInfo?.available && (
+            <div
+              className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[11px]"
+              title={systemInfo.version}
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span>FFmpeg Ready</span>
+            </div>
+          )}
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1">
-        {/* Left Column: Video Upload, Preview, Metadata, Progress */}
-        <div className="lg:col-span-7 space-y-6">
-          {/* Upload Dropzone or Active Video Card */}
+      {/* Main Studio Workspace: 8-Col Cinema Stage + 4-Col Tabbed Inspector */}
+      <main className="flex-1 max-w-[1600px] w-full mx-auto p-4 grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+        {/* Left 8 Columns: Cinema Viewport, Status Ribbon & Collapsible Timeline */}
+        <div className="lg:col-span-8 flex flex-col gap-4">
           {!video ? (
             <div
               onDragOver={(e) => e.preventDefault()}
@@ -537,18 +772,8 @@ export default function App() {
                 const f = e.dataTransfer.files?.[0];
                 if (f) handleFileUpload(f);
               }}
-              className="border-2 border-dashed border-slate-800 hover:border-indigo-500/60 bg-slate-900/40 rounded-2xl p-10 text-center transition flex flex-col items-center justify-center min-h-[340px]"
+              className="border-2 border-dashed border-slate-800 hover:border-indigo-500/60 bg-[#0d1117]/80 rounded-2xl p-12 text-center transition flex flex-col items-center justify-center min-h-[480px]"
             >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="video/*"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) handleFileUpload(f);
-                }}
-              />
               <div className="w-16 h-16 rounded-2xl bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center mb-4 text-indigo-400">
                 {isUploading ? (
                   <Loader2 className="w-8 h-8 animate-spin" />
@@ -556,11 +781,11 @@ export default function App() {
                   <Upload className="w-8 h-8" />
                 )}
               </div>
-              <h2 className="text-lg font-semibold text-white mb-1">
-                Drop a video file here, or browse
+              <h2 className="text-xl font-bold text-white mb-1.5">
+                Drop a video to open in FrameScale Studio
               </h2>
               <p className="text-sm text-slate-400 max-w-md mb-6">
-                Supports MP4, MOV, MKV, WebM, AVI. Inspect frame resolution and upscale up to 4K UHD or 7200px with Lanczos & Unsharp filters.
+                Upscale up to 4K UHD & 7200px, enhance clarity & color in real time, remove watermarks, or unwrap 360° VR footage.
               </p>
 
               <div className="flex flex-wrap items-center justify-center gap-3">
@@ -568,63 +793,25 @@ export default function App() {
                   type="button"
                   disabled={isUploading}
                   onClick={() => fileInputRef.current?.click()}
-                  className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium text-sm shadow-lg shadow-indigo-600/25 transition cursor-pointer"
+                  className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold text-sm shadow-lg shadow-indigo-600/25 transition cursor-pointer"
                 >
-                  {isUploading ? 'Loading Video...' : 'Select Video File'}
+                  {isUploading ? 'Loading Media...' : 'Browse Video Files'}
                 </button>
 
                 <button
                   type="button"
                   disabled={isUploading}
                   onClick={handleGenerateSample}
-                  className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-medium text-sm border border-slate-700 transition cursor-pointer"
+                  className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-medium text-sm border border-slate-700 transition cursor-pointer"
                 >
                   <Wand2 className="w-4 h-4 text-indigo-400" />
-                  Load 360p Demo Test Video
+                  Load 360p Demo Clip
                 </button>
               </div>
             </div>
           ) : (
-            <div className="space-y-4">
-              {/* File Header Bar */}
-              <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900/80 border border-slate-800 px-4 py-3 rounded-xl">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="p-2 rounded-lg bg-indigo-500/15 text-indigo-400">
-                    <FileVideo className="w-5 h-5" />
-                  </div>
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-white truncate">
-                      {video.originalName}
-                    </p>
-                    <p className="text-xs text-slate-400">
-                      {video.metadata.width}×{video.metadata.height} • {video.metadata.fps} fps •{' '}
-                      {video.metadata.codec.toUpperCase()} • {formatBytes(video.metadata.sizeBytes)}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="video/*"
-                    className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      if (f) handleFileUpload(f);
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-slate-200 border border-slate-700 transition cursor-pointer"
-                  >
-                    Change Video
-                  </button>
-                </div>
-              </div>
-
-              {/* Interactive Before/After Video Player */}
+            <>
+              {/* Large Cinema Monitor with Live FFmpeg Frame Preview */}
               <VideoComparePlayer
                 sourceUrl={video.url}
                 outputUrl={job?.outputUrl || null}
@@ -638,979 +825,1195 @@ export default function App() {
                 onChangeWatermarkBoxes={(boxes) =>
                   setConfig((prev) => ({ ...prev, watermarkBoxes: boxes }))
                 }
+                externalSeekTime={seekTarget}
+                onTimeChange={(t) => setPlayheadTime(t)}
+                livePreviewFrameUrl={livePreviewUrl}
+                isLivePreviewLoading={isLivePreviewLoading}
+                livePreviewEnabled={livePreviewEnabled}
+                onToggleLivePreview={() => setLivePreviewEnabled((v) => !v)}
+                vrNormalizeEnabled={config.vrNormalizeEnabled}
+                vrYaw={config.vrYaw}
+                vrPitch={config.vrPitch}
+                onChangeVrAngles={(yaw, pitch) =>
+                  setConfig((prev) => ({ ...prev, vrYaw: yaw, vrPitch: pitch }))
+                }
               />
 
-              {/* Source & Output Stream Comparison Cards */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                <div className="bg-slate-900/70 border border-slate-800/90 rounded-xl p-3">
-                  <span className="text-[11px] uppercase tracking-wider text-slate-400 block">
-                    {isSidewaysRotation ? 'Rotated Input' : 'Source Frame'}
+              {/* Compact Pipeline Telemetry Pill Bar */}
+              <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 rounded-xl bg-[#0d1117] border border-slate-800/80 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-slate-400">Pipeline:</span>
+                  <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-800 font-mono text-slate-200">
+                    {rotatedSourceW}×{rotatedSourceH} →{' '}
+                    <strong className="text-indigo-300">
+                      {effectiveOutW}×{effectiveOutH}
+                    </strong>{' '}
+                    ({outputAspectRatio}{scaleFactor ? ` • ${scaleFactor}×` : ''})
                   </span>
-                  <span className="text-sm font-bold text-white font-mono">
-                    {rotatedSourceW} × {rotatedSourceH}
-                  </span>
-                  <span className="text-[11px] text-slate-400 block mt-0.5">
-                    AR {formatAspectRatio(rotatedSourceW, rotatedSourceH)}
-                    {video.metadata.sourceRotation
-                      ? ` (Meta ${video.metadata.sourceRotation}°)`
-                      : ''}
-                  </span>
-                </div>
-
-                <div className="bg-slate-900/70 border border-indigo-500/30 rounded-xl p-3">
-                  <span className="text-[11px] uppercase tracking-wider text-indigo-300 block">
-                    Final Output
-                  </span>
-                  <span className="text-sm font-bold text-indigo-300 font-mono">
-                    {effectiveOutW} × {effectiveOutH}
-                  </span>
-                  <span className="text-[11px] text-indigo-400/90 block mt-0.5">
-                    AR {outputAspectRatio} • {scaleFactor ? `${scaleFactor}×` : config.presetId.toUpperCase()}
-                  </span>
-                </div>
-
-                <div className="bg-slate-900/70 border border-slate-800/90 rounded-xl p-3">
-                  <span className="text-[11px] uppercase tracking-wider text-slate-400 block">
-                    Codec / PixFmt
-                  </span>
-                  <span className="text-sm font-bold text-white font-mono">
-                    {config.codec.replace('_videotoolbox', ' (HW)')}
-                  </span>
-                  <span className="text-[11px] text-slate-400 block mt-0.5">
-                    {config.pixelFormat} • {config.container.toUpperCase()}
-                  </span>
-                </div>
-
-                <div className="bg-slate-900/70 border border-slate-800/90 rounded-xl p-3">
-                  <span className="text-[11px] uppercase tracking-wider text-slate-400 block">
-                    Scaler & Filter
-                  </span>
-                  <span className="text-sm font-bold text-white capitalize">
+                  <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300 capitalize">
                     {config.scaleAlgorithm}
                   </span>
-                  <span className="text-[11px] text-slate-400 block mt-0.5">
-                    Sharpen: {config.sharpenPreset}
-                  </span>
+                  {config.enhancePreset !== 'none' && (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 capitalize">
+                      Look: {config.enhancePreset}
+                    </span>
+                  )}
+                  {config.vrNormalizeEnabled && (
+                    <span className="px-2 py-0.5 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-300">
+                      360°→2D ({config.vrFov}° FOV)
+                    </span>
+                  )}
+                  {config.watermarkEnabled && config.watermarkBoxes.length > 0 && (
+                    <span className="px-2 py-0.5 rounded bg-rose-500/15 border border-rose-500/30 text-rose-300">
+                      Delogo ({config.watermarkBoxes.length})
+                    </span>
+                  )}
                 </div>
+
+                <span className="font-mono text-slate-400">
+                  {config.codec.replace('_videotoolbox', ' HW')} • {config.container.toUpperCase()}
+                </span>
               </div>
-            </div>
+
+              {/* Active / Completed Render Progress Banner */}
+              {job && (
+                <div className="bg-[#0d1117] border border-slate-800 rounded-2xl p-4 space-y-3 shadow-xl">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      {job.status === 'processing' && (
+                        <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />
+                      )}
+                      {job.status === 'completed' && (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      )}
+                      {(job.status === 'failed' || job.status === 'cancelled') && (
+                        <XCircle className="w-4 h-4 text-rose-400" />
+                      )}
+                      <span className="text-xs font-semibold text-white">
+                        {job.status === 'processing' &&
+                          `Rendering ${effectiveOutW}×${effectiveOutH} (${job.progress}%)...`}
+                        {job.status === 'completed' &&
+                          `Render Complete • ${job.outputMetadata?.width}×${job.outputMetadata?.height} (${formatBytes(
+                            job.outputMetadata?.sizeBytes || 0
+                          )})`}
+                        {job.status === 'failed' && 'Encoding Failed'}
+                        {job.status === 'cancelled' && 'Render Cancelled'}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-3 text-xs font-mono text-slate-400">
+                      {job.fps > 0 && <span>{job.fps.toFixed(1)} fps</span>}
+                      {job.speed && job.speed !== '0x' && <span>{job.speed}</span>}
+                      {job.status === 'processing' && (
+                        <button
+                          type="button"
+                          onClick={handleCancelJob}
+                          className="text-rose-400 hover:text-rose-300 font-sans font-medium cursor-pointer"
+                        >
+                          Cancel
+                        </button>
+                      )}
+                      {job.status === 'completed' && job.outputUrl && (
+                        <a
+                          href={job.outputUrl}
+                          download={job.outputFilename}
+                          className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-sans font-semibold shadow transition"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          Download MP4
+                        </a>
+                      )}
+                    </div>
+                  </div>
+
+                  {job.status === 'processing' && (
+                    <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-gradient-to-r from-indigo-500 to-violet-500 transition-all duration-300"
+                        style={{ width: `${job.progress}%` }}
+                      />
+                    </div>
+                  )}
+
+                  {job.status === 'failed' && job.error && (
+                    <pre className="p-2.5 rounded-lg bg-slate-950 border border-rose-500/30 text-rose-300 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
+                      {job.error}
+                    </pre>
+                  )}
+                </div>
+              )}
+
+              {/* Collapsible Non-Linear Timeline Drawer */}
+              {showTimelineDrawer && (
+                <VideoTimelineEditor
+                  sourceUrl={video.url}
+                  duration={video.metadata.duration || 10}
+                  currentTime={playheadTime}
+                  onSeek={(t) => {
+                    setPlayheadTime(t);
+                    setSeekTarget(t);
+                  }}
+                />
+              )}
+
+              {/* Collapsible FFmpeg CLI Command Drawer */}
+              {showCliDrawer && (
+                <div className="bg-[#0d1117] border border-slate-800 rounded-xl p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                      <Terminal className="w-3.5 h-3.5 text-indigo-400" />
+                      FFmpeg Pipeline Command
+                    </span>
+                    <button
+                      type="button"
+                      onClick={copyCommand}
+                      className="flex items-center gap-1 px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 cursor-pointer"
+                    >
+                      {copiedCli ? (
+                        <>
+                          <Check className="w-3 h-3 text-emerald-400" />
+                          Copied
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3 h-3" />
+                          Copy
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <pre className="p-2.5 rounded-lg bg-slate-950 text-[11px] font-mono text-indigo-300 overflow-x-auto whitespace-pre-wrap break-all">
+                    {cliCommand}
+                  </pre>
+                </div>
+              )}
+            </>
           )}
 
           {uploadError && (
-            <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-sm flex items-start gap-3">
-              <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
-              <div>
-                <p className="font-semibold">Error</p>
-                <p className="text-xs opacity-90">{uploadError}</p>
-              </div>
+            <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center gap-2.5">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{uploadError}</span>
             </div>
           )}
-
-          {/* Active / Completed Job Status Card */}
-          {job && (
-            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-xl">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2.5">
-                  {job.status === 'processing' && (
-                    <Loader2 className="w-5 h-5 text-indigo-400 animate-spin" />
-                  )}
-                  {job.status === 'completed' && (
-                    <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                  )}
-                  {(job.status === 'failed' || job.status === 'cancelled') && (
-                    <XCircle className="w-5 h-5 text-rose-400" />
-                  )}
-                  <h3 className="text-sm font-semibold text-white">
-                    {job.status === 'processing' && 'Upscaling & Encoding in Progress...'}
-                    {job.status === 'completed' && 'Upscaling Complete!'}
-                    {job.status === 'failed' && 'Encoding Failed'}
-                    {job.status === 'cancelled' && 'Job Cancelled'}
-                  </h3>
-                </div>
-
-                <div className="flex items-center gap-3 text-xs font-mono text-slate-400">
-                  {job.fps > 0 && <span>{job.fps.toFixed(1)} fps</span>}
-                  {job.speed && job.speed !== '0x' && <span>Speed: {job.speed}</span>}
-                  {job.bitrate && <span>{job.bitrate}</span>}
-                </div>
-              </div>
-
-              {/* Progress Bar */}
-              <div className="w-full h-2.5 bg-slate-800 rounded-full overflow-hidden">
-                <div
-                  className={`h-full transition-all duration-300 ${
-                    job.status === 'completed'
-                      ? 'bg-emerald-500'
-                      : job.status === 'failed'
-                      ? 'bg-rose-500'
-                      : 'bg-gradient-to-r from-indigo-500 via-violet-500 to-indigo-400'
-                  }`}
-                  style={{ width: `${job.progress}%` }}
-                />
-              </div>
-
-              <div className="flex items-center justify-between text-xs text-slate-400">
-                <span>
-                  {job.progress}% • {job.currentTimeSec.toFixed(1)}s /{' '}
-                  {job.totalDurationSec.toFixed(1)}s
-                </span>
-
-                {job.status === 'processing' && (
-                  <button
-                    type="button"
-                    onClick={handleCancelJob}
-                    className="text-rose-400 hover:text-rose-300 font-medium cursor-pointer"
-                  >
-                    Cancel Process
-                  </button>
-                )}
-              </div>
-
-              {job.status === 'failed' && job.error && (
-                <pre className="p-3 rounded-lg bg-slate-950 border border-rose-500/30 text-rose-300 text-xs font-mono overflow-x-auto whitespace-pre-wrap">
-                  {job.error}
-                </pre>
-              )}
-
-              {job.status === 'completed' && job.outputUrl && (
-                <div className="pt-2 flex flex-wrap items-center justify-between gap-4 border-t border-slate-800">
-                  <div className="text-xs text-slate-300 space-y-0.5">
-                    <p className="font-semibold text-emerald-300">
-                      Output Verified: {job.outputMetadata?.width}×{job.outputMetadata?.height} (
-                      {job.outputMetadata?.codec?.toUpperCase()})
-                    </p>
-                    <p className="text-slate-400">
-                      File Size: {formatBytes(job.outputMetadata?.sizeBytes || 0)} • Duration:{' '}
-                      {job.outputMetadata?.duration?.toFixed(2)}s
-                    </p>
-                  </div>
-
-                  <a
-                    href={job.outputUrl}
-                    download={job.outputFilename}
-                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold shadow-lg shadow-emerald-600/25 transition"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download {job.outputMetadata?.width}×{job.outputMetadata?.height} Video
-                  </a>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Live FFmpeg Command Inspector */}
-          <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-4 space-y-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-xs font-semibold text-slate-300">
-                <Terminal className="w-4 h-4 text-indigo-400" />
-                <span>Generated FFmpeg Command</span>
-              </div>
-              <button
-                type="button"
-                onClick={copyCommand}
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-xs text-slate-300 transition cursor-pointer"
-              >
-                {copiedCli ? (
-                  <>
-                    <Check className="w-3.5 h-3.5 text-emerald-400" />
-                    Copied
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" />
-                    Copy CLI
-                  </>
-                )}
-              </button>
-            </div>
-            <pre className="p-3 rounded-xl bg-slate-950 border border-slate-800/90 text-xs font-mono text-indigo-300 overflow-x-auto whitespace-pre-wrap break-all leading-relaxed">
-              {cliCommand}
-            </pre>
-          </div>
         </div>
 
-        {/* Right Column: Resolution, Scaler, Codec & Audio Controls */}
-        <div className="lg:col-span-5 space-y-5">
-          {/* 1. Target Frame Resolution Card */}
-          <section className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Maximize2 className="w-4 h-4 text-indigo-400" />
-                <h2 className="text-sm font-semibold text-white">
-                  1. Target Frame Resolution
-                </h2>
-              </div>
-              <span className="text-xs font-mono text-indigo-400">
-                {config.width} × {config.height}
-              </span>
-            </div>
-
-            {/* Preset Grid */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
-              {RESOLUTION_PRESETS.map((p) => {
-                const active = config.presetId === p.id;
-                return (
-                  <button
-                    key={p.id}
-                    type="button"
-                    onClick={() => handleSelectPreset(p)}
-                    className={`text-left p-3 rounded-xl border transition cursor-pointer flex flex-col justify-between ${
-                      active
-                        ? 'bg-indigo-600/20 border-indigo-500 text-white shadow-sm'
-                        : 'bg-slate-950/70 border-slate-800/90 text-slate-300 hover:border-slate-700'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between w-full mb-1">
-                      <span className="text-xs font-bold">{p.badge}</span>
-                      {active && <span className="w-2 h-2 rounded-full bg-indigo-400" />}
-                    </div>
-                    <div className="text-[11px] font-medium text-slate-200 truncate">
-                      {p.label}
-                    </div>
-                    <div className="text-[10px] font-mono text-slate-400 mt-0.5">
-                      {p.id === 'custom' ? 'Custom W×H' : `${p.width}×${p.height}`}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Custom Width / Height Inputs */}
-            <div className="grid grid-cols-11 gap-2 items-end pt-1">
-              <div className="col-span-5">
-                <label className="block text-xs text-slate-400 mb-1">
-                  Frame Width (px)
-                </label>
-                <input
-                  type="number"
-                  min={64}
-                  max={15360}
-                  step={2}
-                  value={config.width}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      presetId: 'custom',
-                      width: Number(e.target.value) || 1920,
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono text-white focus:outline-none focus:border-indigo-500"
-                />
-              </div>
-
-              <div className="col-span-1 flex justify-center">
+        {/* Right 4 Columns: Unified Tabbed Inspector Panel */}
+        <aside className="lg:col-span-4 bg-[#0d1117] border border-slate-800/90 rounded-2xl overflow-hidden shadow-2xl flex flex-col lg:sticky lg:top-18">
+          {/* 4-Tab Segmented Navigation */}
+          <div className="grid grid-cols-4 p-1.5 bg-slate-950/90 border-b border-slate-800/80 gap-1">
+            {(
+              [
+                { id: 'geometry', label: 'Scale', icon: Maximize2 },
+                { id: 'enhance', label: 'Enhance', icon: SunMedium },
+                {
+                  id: 'cleanup',
+                  label: 'VR / Clean',
+                  icon: Compass,
+                  alert: Boolean(
+                    video?.metadata.vr360?.isVr360 || config.watermarkEnabled
+                  ),
+                },
+                { id: 'export', label: 'Codec', icon: Cpu },
+              ] as const
+            ).map((tab) => {
+              const Icon = tab.icon;
+              const active = activeTab === tab.id;
+              return (
                 <button
+                  key={tab.id}
                   type="button"
-                  title="Swap Width & Height (Landscape ↔ Portrait)"
-                  onClick={() =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      width: prev.height,
-                      height: prev.width,
-                    }))
-                  }
-                  className="p-2 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-indigo-400 text-xs font-bold transition cursor-pointer"
-                >
-                  ⇄
-                </button>
-              </div>
-
-              <div className="col-span-5">
-                <label className="block text-xs text-slate-400 mb-1">
-                  Frame Height (px)
-                </label>
-                <input
-                  type="number"
-                  min={64}
-                  max={15360}
-                  step={2}
-                  value={config.height}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      presetId: 'custom',
-                      height: Number(e.target.value) || 1080,
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-sm font-mono text-white focus:outline-none focus:border-indigo-500"
-                />
-              </div>
-            </div>
-
-            {/* Video Rotation & Flip Controls */}
-            <div className="pt-1 border-t border-slate-800/80 space-y-2.5">
-              <div className="flex items-center justify-between">
-                <label className="text-xs text-slate-400">
-                  Video Rotation & Orientation
-                </label>
-                <span className="text-[11px] font-mono text-indigo-400">
-                  {config.rotation}°
-                  {config.flipHorizontal ? ' + FlipH' : ''}
-                  {config.flipVertical ? ' + FlipV' : ''}
-                </span>
-              </div>
-
-              <div className="grid grid-cols-4 gap-2">
-                {([
-                  { deg: 0, label: '0° Normal' },
-                  { deg: 90, label: '90° CW' },
-                  { deg: 180, label: '180° Upside' },
-                  { deg: 270, label: '270° CCW' },
-                ] as const).map((item) => (
-                  <button
-                    key={item.deg}
-                    type="button"
-                    onClick={() => handleSetRotation(item.deg)}
-                    className={`py-2 px-2 rounded-xl border text-xs font-medium flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                      config.rotation === item.deg
-                        ? 'bg-indigo-600/20 border-indigo-500 text-white'
-                        : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
-                    }`}
-                  >
-                    {item.deg === 270 ? (
-                      <RotateCcw className="w-3.5 h-3.5 text-indigo-400" />
-                    ) : (
-                      <RotateCw className="w-3.5 h-3.5 text-indigo-400" />
-                    )}
-                    <span>{item.label}</span>
-                  </button>
-                ))}
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  onClick={() =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      flipHorizontal: !prev.flipHorizontal,
-                    }))
-                  }
-                  className={`py-2 px-3 rounded-xl border text-xs font-medium flex items-center justify-center gap-2 transition cursor-pointer ${
-                    config.flipHorizontal
-                      ? 'bg-indigo-600/20 border-indigo-500 text-white'
-                      : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`relative py-2 px-2 rounded-xl text-xs font-semibold flex flex-col items-center justify-center gap-1 transition cursor-pointer ${
+                    active
+                      ? 'bg-indigo-600 text-white shadow'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/60'
                   }`}
                 >
-                  <FlipHorizontal className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>Flip Horizontal (Mirror)</span>
+                  <Icon className="w-3.5 h-3.5" />
+                  <span>{tab.label}</span>
+                  {'alert' in tab && tab.alert && !active && (
+                    <span className="absolute top-1.5 right-2 w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                  )}
                 </button>
+              );
+            })}
+          </div>
 
-                <button
-                  type="button"
-                  onClick={() =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      flipVertical: !prev.flipVertical,
-                    }))
-                  }
-                  className={`py-2 px-3 rounded-xl border text-xs font-medium flex items-center justify-center gap-2 transition cursor-pointer ${
-                    config.flipVertical
-                      ? 'bg-indigo-600/20 border-indigo-500 text-white'
-                      : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
-                  }`}
-                >
-                  <FlipVertical className="w-3.5 h-3.5 text-indigo-400" />
-                  <span>Flip Vertical</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Aspect Ratio Handling */}
-            <div>
-              <label className="block text-xs text-slate-400 mb-1.5">
-                Aspect Ratio & Framing Mode
-              </label>
-              <div className="grid grid-cols-2 gap-2">
-                {[
-                  { id: 'fit', label: 'Fit (Keep Aspect)', desc: 'Scale cleanly inside box' },
-                  { id: 'pad', label: 'Letterbox Pad', desc: 'Exact W×H with black bars' },
-                  { id: 'crop', label: 'Center Crop', desc: 'Fill W×H & crop edges' },
-                  { id: 'stretch', label: 'Stretch Exact', desc: 'Force exact W×H' },
-                ].map((mode) => (
-                  <button
-                    key={mode.id}
-                    type="button"
-                    onClick={() =>
-                      setConfig((prev) => ({
-                        ...prev,
-                        aspectMode: mode.id as UpscaleConfig['aspectMode'],
-                      }))
-                    }
-                    className={`p-2.5 rounded-xl border text-left transition cursor-pointer ${
-                      config.aspectMode === mode.id
-                        ? 'bg-indigo-600/15 border-indigo-500 text-white'
-                        : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
-                    }`}
-                  >
-                    <div className="text-xs font-semibold">{mode.label}</div>
-                    <div className="text-[10px] text-slate-400">{mode.desc}</div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          </section>
-
-          {/* Watermark Detection & Removal Card */}
-          <section className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Eraser className="w-4 h-4 text-rose-400" />
-                <h2 className="text-sm font-semibold text-white">
-                  Watermark Detection & Removal
-                </h2>
-              </div>
-
-              <label className="inline-flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={config.watermarkEnabled}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      watermarkEnabled: e.target.checked,
-                      watermarkBoxes:
-                        e.target.checked && prev.watermarkBoxes.length === 0
-                          ? [
-                              {
-                                id: `wm_${Date.now()}`,
-                                label: 'Bottom-Right',
-                                xPct: 0.76,
-                                yPct: 0.82,
-                                wPct: 0.21,
-                                hPct: 0.13,
-                              },
-                            ]
-                          : prev.watermarkBoxes,
-                    }))
-                  }
-                  className="accent-rose-500 w-4 h-4 rounded cursor-pointer"
-                />
-                <span className="text-xs font-medium text-slate-300">
-                  Enable Delogo Filter
-                </span>
-              </label>
-            </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                disabled={!video || isDetectingWatermark}
-                onClick={handleAutoDetectWatermarks}
-                className="flex-1 py-2 px-3 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 disabled:opacity-40 border border-rose-500/40 text-rose-200 text-xs font-semibold flex items-center justify-center gap-2 transition cursor-pointer"
-              >
-                {isDetectingWatermark ? (
-                  <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    Scanning Video Frames...
-                  </>
-                ) : (
-                  <>
-                    <ScanSearch className="w-4 h-4 text-rose-400" />
-                    Auto-Detect Watermark
-                  </>
-                )}
-              </button>
-
-              {config.watermarkBoxes.length > 0 && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      watermarkBoxes: [],
-                      watermarkEnabled: false,
-                    }))
-                  }
-                  className="py-2 px-2.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-rose-300 text-xs flex items-center gap-1 transition cursor-pointer"
-                  title="Clear all watermark zones"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  Clear
-                </button>
-              )}
-            </div>
-
-            {config.watermarkEnabled && (
-              <div className="space-y-3 pt-1">
-                {/* Quick Corner Presets */}
+          {/* Tab Body */}
+          <div className="p-4 space-y-4 max-h-[calc(100vh-210px)] overflow-y-auto">
+            {/* TAB 1: SCALE, ASPECT & ROTATION */}
+            {activeTab === 'geometry' && (
+              <div className="space-y-4">
                 <div>
-                  <span className="block text-[11px] text-slate-400 mb-1.5">
-                    Add Quick Corner Zone (or drag directly on the video player):
-                  </span>
-                  <div className="grid grid-cols-4 gap-1.5">
-                    {(
-                      [
-                        { id: 'top-left', label: '↖ Top-L' },
-                        { id: 'top-right', label: '↗ Top-R' },
-                        { id: 'bottom-left', label: '↙ Bot-L' },
-                        { id: 'bottom-right', label: '↘ Bot-R' },
-                      ] as const
-                    ).map((c) => (
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold text-slate-300">
+                      Resolution Preset
+                    </span>
+                    <span className="text-xs font-mono text-indigo-400">
+                      {effectiveOutW} × {effectiveOutH}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {RESOLUTION_PRESETS.map((p) => {
+                      const active = config.presetId === p.id;
+                      return (
+                        <button
+                          key={p.id}
+                          type="button"
+                          onClick={() => handleSelectPreset(p)}
+                          className={`p-2.5 rounded-xl border text-left transition cursor-pointer ${
+                            active
+                              ? 'bg-indigo-600/20 border-indigo-500 text-white'
+                              : 'bg-slate-950/70 border-slate-800/90 text-slate-300 hover:border-slate-700'
+                          }`}
+                        >
+                          <div className="text-xs font-bold">{p.badge}</div>
+                          <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                            {p.desc}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Width ↔ Height Inputs */}
+                <div className="grid grid-cols-11 gap-2 items-end">
+                  <div className="col-span-5">
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Width (px)
+                    </label>
+                    <input
+                      type="number"
+                      min={64}
+                      max={15360}
+                      step={2}
+                      value={config.width}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          presetId: 'custom',
+                          width: Number(e.target.value) || 1920,
+                        }))
+                      }
+                      className="w-full px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-white"
+                    />
+                  </div>
+                  <div className="col-span-1 flex justify-center">
+                    <button
+                      type="button"
+                      title="Swap Width & Height"
+                      onClick={() =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          width: prev.height,
+                          height: prev.width,
+                        }))
+                      }
+                      className="p-1.5 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-800 text-indigo-400 text-xs font-bold cursor-pointer"
+                    >
+                      ⇄
+                    </button>
+                  </div>
+                  <div className="col-span-5">
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Height (px)
+                    </label>
+                    <input
+                      type="number"
+                      min={64}
+                      max={15360}
+                      step={2}
+                      value={config.height}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          presetId: 'custom',
+                          height: Number(e.target.value) || 1080,
+                        }))
+                      }
+                      className="w-full px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono text-white"
+                    />
+                  </div>
+                </div>
+
+                {/* Aspect Ratio Mode */}
+                <div>
+                  <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                    Framing & Aspect Ratio
+                  </label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {[
+                      { id: 'fit', label: 'Fit Inside', desc: 'Keep aspect ratio' },
+                      { id: 'pad', label: 'Letterbox Pad', desc: 'Add black bars' },
+                      { id: 'crop', label: 'Center Crop', desc: 'Fill & crop edges' },
+                      { id: 'stretch', label: 'Stretch Exact', desc: 'Force W×H' },
+                    ].map((mode) => (
                       <button
-                        key={c.id}
+                        key={mode.id}
                         type="button"
-                        onClick={() => handleAddCornerWatermarkPreset(c.id)}
-                        className="py-1.5 px-2 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-800 text-[11px] text-slate-300 font-medium transition cursor-pointer"
+                        onClick={() =>
+                          setConfig((prev) => ({
+                            ...prev,
+                            aspectMode: mode.id as UpscaleConfig['aspectMode'],
+                          }))
+                        }
+                        className={`p-2 rounded-xl border text-left transition cursor-pointer ${
+                          config.aspectMode === mode.id
+                            ? 'bg-indigo-600/20 border-indigo-500 text-white'
+                            : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:border-slate-700'
+                        }`}
                       >
-                        {c.label}
+                        <div className="text-xs font-semibold">{mode.label}</div>
+                        <div className="text-[10px] text-slate-400">{mode.desc}</div>
                       </button>
                     ))}
                   </div>
                 </div>
 
-                {/* Removal Mode */}
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-slate-400">Inpainting Strength</span>
-                  <div className="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
+                {/* Rotation & Flip Strip */}
+                <div>
+                  <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                    Orientation & Mirror
+                  </label>
+                  <div className="grid grid-cols-6 gap-1.5">
+                    {([0, 90, 180, 270] as const).map((deg) => (
+                      <button
+                        key={deg}
+                        type="button"
+                        onClick={() => handleSetRotation(deg)}
+                        className={`py-2 rounded-xl border text-xs font-mono font-semibold flex items-center justify-center transition cursor-pointer ${
+                          config.rotation === deg
+                            ? 'bg-indigo-600 border-indigo-500 text-white'
+                            : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                        }`}
+                        title={`Rotate ${deg}°`}
+                      >
+                        {deg}°
+                      </button>
+                    ))}
                     <button
                       type="button"
                       onClick={() =>
-                        setConfig((prev) => ({ ...prev, watermarkMode: 'delogo' }))
+                        setConfig((prev) => ({
+                          ...prev,
+                          flipHorizontal: !prev.flipHorizontal,
+                        }))
                       }
-                      className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
-                        config.watermarkMode === 'delogo'
-                          ? 'bg-rose-600 text-white'
-                          : 'text-slate-400'
+                      className={`py-2 rounded-xl border flex items-center justify-center transition cursor-pointer ${
+                        config.flipHorizontal
+                          ? 'bg-indigo-600 border-indigo-500 text-white'
+                          : 'bg-slate-950 border-slate-800 text-slate-300'
                       }`}
+                      title="Flip Horizontal (Mirror)"
                     >
-                      Standard Delogo
+                      <FlipHorizontal className="w-3.5 h-3.5" />
                     </button>
                     <button
                       type="button"
                       onClick={() =>
-                        setConfig((prev) => ({ ...prev, watermarkMode: 'blur' }))
+                        setConfig((prev) => ({
+                          ...prev,
+                          flipVertical: !prev.flipVertical,
+                        }))
                       }
-                      className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
-                        config.watermarkMode === 'blur'
-                          ? 'bg-rose-600 text-white'
-                          : 'text-slate-400'
+                      className={`py-2 rounded-xl border flex items-center justify-center transition cursor-pointer ${
+                        config.flipVertical
+                          ? 'bg-indigo-600 border-indigo-500 text-white'
+                          : 'bg-slate-950 border-slate-800 text-slate-300'
                       }`}
+                      title="Flip Vertical"
                     >
-                      Deep Multi-Pass
+                      <FlipVertical className="w-3.5 h-3.5" />
                     </button>
                   </div>
                 </div>
+              </div>
+            )}
 
-                {/* Active Watermark Zones List */}
-                {config.watermarkBoxes.length > 0 && (
-                  <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-                    {config.watermarkBoxes.map((b, i) => {
-                      const srcW = video?.metadata.width || 1920;
-                      const srcH = video?.metadata.height || 1080;
-                      const pxX = Math.round(b.xPct * srcW);
-                      const pxY = Math.round(b.yPct * srcH);
-                      const pxW = Math.round(b.wPct * srcW);
-                      const pxH = Math.round(b.hPct * srcH);
-                      return (
-                        <div
-                          key={b.id}
-                          className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-slate-950/90 border border-rose-500/30 text-xs"
+            {/* TAB 2: VIDEO ENHANCING, CLARITY & COLOR GRADING */}
+            {activeTab === 'enhance' && (
+              <div className="space-y-4">
+                {/* 1-Click Enhancement Profiles */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="text-xs font-semibold text-slate-300">
+                      1-Click Enhancement Profile
+                    </span>
+                    {config.enhancePreset !== 'none' && (
+                      <button
+                        type="button"
+                        onClick={() => applyEnhancePreset('none')}
+                        className="text-[11px] text-slate-400 hover:text-white cursor-pointer"
+                      >
+                        Reset All
+                      </button>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(
+                      [
+                        { id: 'none', label: 'Neutral' },
+                        { id: 'cinema', label: 'Cinema Crisp' },
+                        { id: 'vivid', label: 'Vivid HDR' },
+                        { id: 'restore', label: 'AI-Style Restore' },
+                        { id: 'lowlight', label: 'Night Boost' },
+                      ] as const
+                    ).map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => applyEnhancePreset(p.id)}
+                        className={`py-2 px-2.5 rounded-xl border text-xs font-medium transition cursor-pointer ${
+                          config.enhancePreset === p.id
+                            ? 'bg-indigo-600/25 border-indigo-500 text-white'
+                            : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                        }`}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Upscale Kernel & Denoise */}
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Upscale Kernel
+                    </label>
+                    <select
+                      value={config.scaleAlgorithm}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          scaleAlgorithm: e.target.value as UpscaleConfig['scaleAlgorithm'],
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                    >
+                      <option value="lanczos">Lanczos (Sharpest)</option>
+                      <option value="spline">Spline (Natural)</option>
+                      <option value="bicubic">Bicubic</option>
+                      <option value="bilinear">Bilinear</option>
+                      <option value="neighbor">Nearest (Pixel Art)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">
+                      Noise Reduction
+                    </label>
+                    <select
+                      value={config.denoise}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          enhancePreset: 'custom',
+                          denoise: e.target.value as UpscaleConfig['denoise'],
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                    >
+                      <option value="none">Off</option>
+                      <option value="light">Light (hqdn3d)</option>
+                      <option value="medium">Medium (hqdn3d)</option>
+                      <option value="nlmeans">Deep Studio (nlmeans)</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Detail & Contrast Adaptive Sharpening (CAS + Unsharp) */}
+                <div className="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3 space-y-3">
+                  <div>
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-slate-300">
+                        Contrast Adaptive Sharpen (`cas`)
+                      </span>
+                      <span className="font-mono text-indigo-400">
+                        {Math.round(config.casStrength * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={config.casStrength}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          enhancePreset: 'custom',
+                          casStrength: parseFloat(e.target.value),
+                        }))
+                      }
+                      className="w-full accent-indigo-500"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-slate-300">Unsharp Edge Micro-Detail</span>
+                      <span className="font-mono text-indigo-400 capitalize">
+                        {config.sharpenPreset}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-1">
+                      {(['none', 'light', 'medium', 'strong'] as const).map((sp) => (
+                        <button
+                          key={sp}
+                          type="button"
+                          onClick={() =>
+                            setConfig((prev) => ({
+                              ...prev,
+                              enhancePreset: 'custom',
+                              sharpenPreset: sp,
+                            }))
+                          }
+                          className={`py-1 rounded-lg text-[11px] font-medium capitalize border cursor-pointer ${
+                            config.sharpenPreset === sp
+                              ? 'bg-indigo-600 border-indigo-500 text-white'
+                              : 'bg-slate-900 border-slate-800 text-slate-400'
+                          }`}
                         >
-                          <div className="flex items-center gap-2">
-                            <span className="text-rose-400 font-semibold">
-                              #{i + 1} {b.label || 'Zone'}
-                            </span>
-                            <span className="font-mono text-[11px] text-slate-400">
-                              x:{pxX} y:{pxY} ({pxW}×{pxH}px)
-                            </span>
+                          {sp}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-1">
+                    <label className="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={config.debandEnabled}
+                        onChange={(e) =>
+                          setConfig((prev) => ({
+                            ...prev,
+                            enhancePreset: 'custom',
+                            debandEnabled: e.target.checked,
+                          }))
+                        }
+                        className="accent-indigo-500 rounded"
+                      />
+                      <span>Deband Sky/Gradients</span>
+                    </label>
+
+                    <label className="inline-flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={config.deinterlaceEnabled}
+                        onChange={(e) =>
+                          setConfig((prev) => ({
+                            ...prev,
+                            deinterlaceEnabled: e.target.checked,
+                          }))
+                        }
+                        className="accent-indigo-500 rounded"
+                      />
+                      <span>Deinterlace (`bwdif`)</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Color & Tone Grading Sliders */}
+                <div className="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                      Color & Tone Grading (`eq` + `vibrance`)
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          brightness: 0,
+                          contrast: 1,
+                          saturation: 1,
+                          gamma: 1,
+                          vibrance: 0,
+                        }))
+                      }
+                      className="text-[11px] text-slate-400 hover:text-white cursor-pointer"
+                    >
+                      Reset Color
+                    </button>
+                  </div>
+
+                  {[
+                    {
+                      label: 'Brightness',
+                      key: 'brightness' as const,
+                      min: -0.35,
+                      max: 0.35,
+                      step: 0.02,
+                      fmt: (v: number) => (v > 0 ? `+${v.toFixed(2)}` : v.toFixed(2)),
+                    },
+                    {
+                      label: 'Contrast',
+                      key: 'contrast' as const,
+                      min: 0.6,
+                      max: 1.6,
+                      step: 0.02,
+                      fmt: (v: number) => `${v.toFixed(2)}×`,
+                    },
+                    {
+                      label: 'Saturation',
+                      key: 'saturation' as const,
+                      min: 0,
+                      max: 2.0,
+                      step: 0.05,
+                      fmt: (v: number) => `${v.toFixed(2)}×`,
+                    },
+                    {
+                      label: 'Vibrance',
+                      key: 'vibrance' as const,
+                      min: -0.8,
+                      max: 1.2,
+                      step: 0.05,
+                      fmt: (v: number) => (v > 0 ? `+${v.toFixed(2)}` : v.toFixed(2)),
+                    },
+                    {
+                      label: 'Gamma (Shadows)',
+                      key: 'gamma' as const,
+                      min: 0.6,
+                      max: 1.8,
+                      step: 0.02,
+                      fmt: (v: number) => v.toFixed(2),
+                    },
+                  ].map((slider) => (
+                    <div key={slider.key}>
+                      <div className="flex justify-between text-[11px] mb-0.5">
+                        <span className="text-slate-400">{slider.label}</span>
+                        <span className="font-mono text-indigo-300">
+                          {slider.fmt(config[slider.key])}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={slider.min}
+                        max={slider.max}
+                        step={slider.step}
+                        value={config[slider.key]}
+                        onChange={(e) =>
+                          setConfig((prev) => ({
+                            ...prev,
+                            enhancePreset: 'custom',
+                            [slider.key]: parseFloat(e.target.value),
+                          }))
+                        }
+                        className="w-full accent-indigo-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 3: VR / 360° NORMALIZATION & WATERMARK CLEANUP */}
+            {activeTab === 'cleanup' && (
+              <div className="space-y-4">
+                {/* VR / 360 Section */}
+                <div className="bg-slate-950/70 border border-slate-800/90 rounded-xl p-3.5 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Compass className="w-4 h-4 text-cyan-400" />
+                      <span className="text-xs font-semibold text-white">
+                        VR / 360° Flat Normalization
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={config.vrNormalizeEnabled}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          vrNormalizeEnabled: e.target.checked,
+                        }))
+                      }
+                      className="accent-cyan-500 w-4 h-4 rounded cursor-pointer"
+                    />
+                  </div>
+
+                  {video?.metadata.vr360?.isVr360 && (
+                    <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-[11px] text-cyan-200">
+                      Detected: {video.metadata.vr360.reason}
+                    </div>
+                  )}
+
+                  {config.vrNormalizeEnabled && (
+                    <div className="space-y-2.5 pt-1">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-[11px] text-slate-400 mb-1">
+                            Input Projection
+                          </label>
+                          <select
+                            value={config.vrInputProjection}
+                            onChange={(e) =>
+                              setConfig((prev) => ({
+                                ...prev,
+                                vrInputProjection: e.target
+                                  .value as UpscaleConfig['vrInputProjection'],
+                              }))
+                            }
+                            className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-white"
+                          >
+                            <option value="e">360° Equirectangular</option>
+                            <option value="hequirect">VR180 Half-Equirect</option>
+                            <option value="dfisheye">Dual Fisheye</option>
+                            <option value="fisheye">Single Fisheye</option>
+                            <option value="cubemap">Cubemap</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-[11px] text-slate-400 mb-1">
+                            Stereo 3D Eye
+                          </label>
+                          <select
+                            value={config.vrStereoMode}
+                            onChange={(e) =>
+                              setConfig((prev) => ({
+                                ...prev,
+                                vrStereoMode: e.target
+                                  .value as UpscaleConfig['vrStereoMode'],
+                              }))
+                            }
+                            className="w-full px-2 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-white"
+                          >
+                            <option value="mono">Mono (2D)</option>
+                            <option value="sbs">Side-by-Side (Left Eye)</option>
+                            <option value="tb">Top-Bottom (Top Eye)</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2.5">
+                        <div>
+                          <div className="flex justify-between text-[11px]">
+                            <span className="text-slate-400">FOV Zoom</span>
+                            <span className="font-mono text-cyan-300">{config.vrFov}°</span>
                           </div>
+                          <input
+                            type="range"
+                            min={50}
+                            max={135}
+                            value={config.vrFov}
+                            onChange={(e) =>
+                              setConfig((prev) => ({
+                                ...prev,
+                                vrFov: Number(e.target.value),
+                              }))
+                            }
+                            className="w-full accent-cyan-500"
+                          />
+                        </div>
+
+                        <div>
+                          <div className="flex justify-between text-[11px]">
+                            <span className="text-slate-400">Yaw (Pan)</span>
+                            <span className="font-mono text-cyan-300">{config.vrYaw}°</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={-180}
+                            max={180}
+                            value={config.vrYaw}
+                            onChange={(e) =>
+                              setConfig((prev) => ({
+                                ...prev,
+                                vrYaw: Number(e.target.value),
+                              }))
+                            }
+                            className="w-full accent-cyan-500"
+                          />
+                        </div>
+
+                        <div>
+                          <div className="flex justify-between text-[11px]">
+                            <span className="text-slate-400">Pitch (Tilt)</span>
+                            <span className="font-mono text-cyan-300">{config.vrPitch}°</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={-90}
+                            max={90}
+                            value={config.vrPitch}
+                            onChange={(e) =>
+                              setConfig((prev) => ({
+                                ...prev,
+                                vrPitch: Number(e.target.value),
+                              }))
+                            }
+                            className="w-full accent-cyan-500"
+                          />
+                        </div>
+
+                        <div>
+                          <div className="flex justify-between text-[11px]">
+                            <span className="text-slate-400">Roll (Level)</span>
+                            <span className="font-mono text-cyan-300">{config.vrRoll}°</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={-180}
+                            max={180}
+                            value={config.vrRoll}
+                            onChange={(e) =>
+                              setConfig((prev) => ({
+                                ...prev,
+                                vrRoll: Number(e.target.value),
+                              }))
+                            }
+                            className="w-full accent-cyan-500"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Watermark Detection & Delogo Removal Section */}
+                <div className="bg-slate-950/70 border border-slate-800/90 rounded-xl p-3.5 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Eraser className="w-4 h-4 text-rose-400" />
+                      <span className="text-xs font-semibold text-white">
+                        Watermark Removal (`delogo`)
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={config.watermarkEnabled}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          watermarkEnabled: e.target.checked,
+                          watermarkBoxes:
+                            e.target.checked && prev.watermarkBoxes.length === 0
+                              ? [
+                                  {
+                                    id: `wm_${Date.now()}`,
+                                    label: 'Bottom-Right',
+                                    xPct: 0.76,
+                                    yPct: 0.82,
+                                    wPct: 0.21,
+                                    hPct: 0.13,
+                                  },
+                                ]
+                              : prev.watermarkBoxes,
+                        }))
+                      }
+                      className="accent-rose-500 w-4 h-4 rounded cursor-pointer"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={!video || isDetectingWatermark}
+                      onClick={handleAutoDetectWatermarks}
+                      className="flex-1 py-2 px-3 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 disabled:opacity-40 border border-rose-500/40 text-rose-200 text-xs font-semibold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      {isDetectingWatermark ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          Scanning...
+                        </>
+                      ) : (
+                        <>
+                          <ScanSearch className="w-3.5 h-3.5 text-rose-400" />
+                          Auto-Detect Logo
+                        </>
+                      )}
+                    </button>
+
+                    {config.watermarkBoxes.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setConfig((prev) => ({
+                            ...prev,
+                            watermarkBoxes: [],
+                            watermarkEnabled: false,
+                          }))
+                        }
+                        className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-rose-300 cursor-pointer"
+                        title="Clear all watermark boxes"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {config.watermarkEnabled && (
+                    <div className="space-y-2 text-[11px] text-slate-400">
+                      <p>
+                        Tip: Drag directly on the video monitor to draw custom removal boxes.
+                      </p>
+                      <div className="flex items-center justify-between pt-1">
+                        <span>Inpaint Mode</span>
+                        <div className="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800">
                           <button
                             type="button"
                             onClick={() =>
-                              setConfig((prev) => ({
-                                ...prev,
-                                watermarkBoxes: prev.watermarkBoxes.filter(
-                                  (item) => item.id !== b.id
-                                ),
-                              }))
+                              setConfig((prev) => ({ ...prev, watermarkMode: 'delogo' }))
                             }
-                            className="text-slate-500 hover:text-rose-400 transition cursor-pointer"
+                            className={`px-2 py-0.5 rounded text-[11px] cursor-pointer ${
+                              config.watermarkMode === 'delogo'
+                                ? 'bg-rose-600 text-white'
+                                : 'text-slate-400'
+                            }`}
                           >
-                            ✕
+                            Standard
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setConfig((prev) => ({ ...prev, watermarkMode: 'blur' }))
+                            }
+                            className={`px-2 py-0.5 rounded text-[11px] cursor-pointer ${
+                              config.watermarkMode === 'blur'
+                                ? 'bg-rose-600 text-white'
+                                : 'text-slate-400'
+                            }`}
+                          >
+                            Deep Multi-Pass
                           </button>
                         </div>
-                      );
-                    })}
-                  </div>
-                )}
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
-          </section>
 
-          {/* 2. Upscaling Algorithm & Detail Enhancement */}
-          <section className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-4">
-            <div className="flex items-center gap-2">
-              <Sliders className="w-4 h-4 text-indigo-400" />
-              <h2 className="text-sm font-semibold text-white">
-                2. Upscaling Algorithm & Detail Enhancement
-              </h2>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">
-                  FFmpeg Swscale Kernel
-                </label>
-                <select
-                  value={config.scaleAlgorithm}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      scaleAlgorithm: e.target.value as UpscaleConfig['scaleAlgorithm'],
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white focus:outline-none focus:border-indigo-500"
-                >
-                  <option value="lanczos">Lanczos (Recommended - Sharpest edges)</option>
-                  <option value="spline">Bicubic Spline (Smooth natural upscale)</option>
-                  <option value="bicubic">Bicubic (Balanced standard scaler)</option>
-                  <option value="bilinear">Bilinear (Fast, softer gradients)</option>
-                  <option value="neighbor">Nearest Neighbor (Pixel Art / Retro crisp)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">
-                  Pre-Denoise Filter (hqdn3d)
-                </label>
-                <select
-                  value={config.denoise}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      denoise: e.target.value as UpscaleConfig['denoise'],
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white focus:outline-none focus:border-indigo-500"
-                >
-                  <option value="none">Disabled (Preserve all grain)</option>
-                  <option value="light">Light Spatial-Temporal Denoise</option>
-                  <option value="medium">Medium Compression Artifact Cleanup</option>
-                </select>
-              </div>
-            </div>
-
-            {/* Unsharp Mask Sharpening */}
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <label className="text-xs text-slate-400">
-                  Unsharp Mask (Edge & Texture Sharpening)
-                </label>
-                <span className="text-xs font-mono text-indigo-400 capitalize">
-                  {config.sharpenPreset}
-                </span>
-              </div>
-              <div className="grid grid-cols-5 gap-1.5">
-                {(['none', 'light', 'medium', 'strong', 'custom'] as const).map((sp) => (
-                  <button
-                    key={sp}
-                    type="button"
-                    onClick={() => setConfig((prev) => ({ ...prev, sharpenPreset: sp }))}
-                    className={`py-1.5 px-2 rounded-lg text-xs font-medium capitalize border transition cursor-pointer ${
-                      config.sharpenPreset === sp
-                        ? 'bg-indigo-600 border-indigo-500 text-white'
-                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {sp}
-                  </button>
-                ))}
-              </div>
-
-              {config.sharpenPreset === 'custom' && (
-                <div className="mt-3 flex items-center gap-3">
-                  <input
-                    type="range"
-                    min={0.1}
-                    max={2.5}
-                    step={0.1}
-                    value={config.sharpenAmount}
+            {/* TAB 4: CODEC, BITRATE & CONTAINER */}
+            {activeTab === 'export' && (
+              <div className="space-y-3.5">
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">
+                    Video Encoder
+                  </label>
+                  <select
+                    value={config.codec}
                     onChange={(e) =>
                       setConfig((prev) => ({
                         ...prev,
-                        sharpenAmount: parseFloat(e.target.value),
+                        codec: e.target.value as UpscaleConfig['codec'],
+                        container:
+                          e.target.value === 'libvpx-vp9'
+                            ? 'webm'
+                            : prev.container === 'webm'
+                            ? 'mp4'
+                            : prev.container,
                       }))
                     }
-                    className="flex-1 accent-indigo-500"
-                  />
-                  <span className="text-xs font-mono text-slate-300 w-12 text-right">
-                    {config.sharpenAmount.toFixed(1)}×
-                  </span>
+                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                  >
+                    <option value="libx264">H.264 / AVC (libx264 Universal MP4)</option>
+                    <option value="libx265">H.265 / HEVC (libx265 4K / 8K)</option>
+                    {systemInfo?.capabilities?.hasVideoToolbox && (
+                      <>
+                        <option value="h264_videotoolbox">
+                          H.264 Apple VideoToolbox (GPU)
+                        </option>
+                        <option value="hevc_videotoolbox">
+                          HEVC Apple VideoToolbox (GPU)
+                        </option>
+                      </>
+                    )}
+                    <option value="libsvtav1">AV1 (SVT-AV1 Next-Gen)</option>
+                    <option value="libvpx-vp9">VP9 (WebM 4K)</option>
+                  </select>
                 </div>
-              )}
-            </div>
-          </section>
 
-          {/* 3. Video Codec, MP4 Container & Hardware Acceleration */}
-          <section className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 space-y-4">
-            <div className="flex items-center gap-2">
-              <Cpu className="w-4 h-4 text-indigo-400" />
-              <h2 className="text-sm font-semibold text-white">
-                3. MP4 / Video Codec & Quality Controls
-              </h2>
-            </div>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Container</label>
+                    <select
+                      value={config.container}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          container: e.target.value as UpscaleConfig['container'],
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                    >
+                      <option value="mp4">MP4 (.mp4)</option>
+                      <option value="mov">QuickTime (.mov)</option>
+                      <option value="mkv">Matroska (.mkv)</option>
+                      <option value="webm">WebM (.webm)</option>
+                    </select>
+                  </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">
-                  Video Encoder / Codec
-                </label>
-                <select
-                  value={config.codec}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      codec: e.target.value as UpscaleConfig['codec'],
-                      container:
-                        e.target.value === 'libvpx-vp9'
-                          ? 'webm'
-                          : prev.container === 'webm'
-                          ? 'mp4'
-                          : prev.container,
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white focus:outline-none focus:border-indigo-500"
-                >
-                  <option value="libx264">H.264 / AVC (libx264 - Universal MP4)</option>
-                  <option value="libx265">H.265 / HEVC (libx265 - Best for 4K / 7200px)</option>
-                  {systemInfo?.capabilities?.hasVideoToolbox && (
-                    <>
-                      <option value="h264_videotoolbox">
-                        H.264 Apple VideoToolbox (GPU Hardware)
-                      </option>
-                      <option value="hevc_videotoolbox">
-                        HEVC Apple VideoToolbox (GPU 4K/8K Fast)
-                      </option>
-                    </>
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Frame Rate</label>
+                    <select
+                      value={config.fps}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          fps: e.target.value as UpscaleConfig['fps'],
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                    >
+                      <option value="source">Source FPS</option>
+                      <option value="24">24 fps</option>
+                      <option value="30">30 fps</option>
+                      <option value="60">60 fps</option>
+                      <option value="120">120 fps</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Quality Control */}
+                <div className="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-slate-400">Rate Control</span>
+                    <div className="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800">
+                      <button
+                        type="button"
+                        onClick={() => setConfig((prev) => ({ ...prev, rateControl: 'crf' }))}
+                        className={`px-2 py-0.5 rounded text-[11px] cursor-pointer ${
+                          config.rateControl === 'crf'
+                            ? 'bg-indigo-600 text-white'
+                            : 'text-slate-400'
+                        }`}
+                      >
+                        CRF Quality
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setConfig((prev) => ({ ...prev, rateControl: 'bitrate' }))
+                        }
+                        className={`px-2 py-0.5 rounded text-[11px] cursor-pointer ${
+                          config.rateControl === 'bitrate'
+                            ? 'bg-indigo-600 text-white'
+                            : 'text-slate-400'
+                        }`}
+                      >
+                        Bitrate (Mbps)
+                      </button>
+                    </div>
+                  </div>
+
+                  {config.rateControl === 'crf' ? (
+                    <div>
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="text-slate-300">CRF {config.crf}</span>
+                        <span className="text-indigo-400 text-[11px]">
+                          {config.crf <= 16
+                            ? 'Lossless Master'
+                            : config.crf <= 20
+                            ? 'High Quality'
+                            : 'Balanced'}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={10}
+                        max={34}
+                        value={config.crf}
+                        onChange={(e) =>
+                          setConfig((prev) => ({ ...prev, crf: Number(e.target.value) }))
+                        }
+                        className="w-full accent-indigo-500"
+                      />
+                    </div>
+                  ) : (
+                    <div>
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="text-slate-300">Target Bitrate</span>
+                        <span className="text-indigo-400 font-mono">
+                          {config.targetBitrateMbps} Mbps
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={2}
+                        max={120}
+                        value={config.targetBitrateMbps}
+                        onChange={(e) =>
+                          setConfig((prev) => ({
+                            ...prev,
+                            targetBitrateMbps: Number(e.target.value),
+                          }))
+                        }
+                        className="w-full accent-indigo-500"
+                      />
+                    </div>
                   )}
-                  <option value="libsvtav1">AV1 (SVT-AV1 Next-Gen Compression)</option>
-                  <option value="libvpx-vp9">VP9 (WebM 4K YouTube Codec)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">
-                  Container Format
-                </label>
-                <select
-                  value={config.container}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      container: e.target.value as UpscaleConfig['container'],
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white focus:outline-none focus:border-indigo-500"
-                >
-                  <option value="mp4">MP4 (.mp4 - Faststart Web Ready)</option>
-                  <option value="mov">QuickTime (.mov)</option>
-                  <option value="mkv">Matroska (.mkv)</option>
-                  <option value="webm">WebM (.webm)</option>
-                </select>
-              </div>
-            </div>
-
-            {config.width > 4096 &&
-              (config.codec === 'libx264' || config.codec === 'h264_videotoolbox') && (
-                <div className="p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-2">
-                  <span>
-                    H.264 max width is 4096px. Use HEVC (H.265) or AV1 for {config.width}px.
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setConfig((prev) => ({ ...prev, codec: 'libx265' }))}
-                    className="px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 font-semibold shrink-0 cursor-pointer"
-                  >
-                    Switch to H.265
-                  </button>
                 </div>
-              )}
 
-            {/* Rate Control Mode: CRF vs Bitrate */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="text-xs text-slate-400">Rate Control</label>
-                <div className="inline-flex rounded-lg bg-slate-950 p-0.5 border border-slate-800">
-                  <button
-                    type="button"
-                    onClick={() => setConfig((prev) => ({ ...prev, rateControl: 'crf' }))}
-                    className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
-                      config.rateControl === 'crf'
-                        ? 'bg-indigo-600 text-white'
-                        : 'text-slate-400'
-                    }`}
-                  >
-                    Constant Quality (CRF)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setConfig((prev) => ({ ...prev, rateControl: 'bitrate' }))}
-                    className={`px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer ${
-                      config.rateControl === 'bitrate'
-                        ? 'bg-indigo-600 text-white'
-                        : 'text-slate-400'
-                    }`}
-                  >
-                    Target Bitrate (Mbps)
-                  </button>
-                </div>
-              </div>
-
-              {config.rateControl === 'crf' ? (
-                <div className="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3">
-                  <div className="flex justify-between text-xs mb-1">
-                    <span className="text-slate-300">
-                      CRF Quality:{' '}
-                      <strong className="text-indigo-400">{config.crf}</strong>{' '}
-                      {config.crf <= 16
-                        ? '(Visually Lossless)'
-                        : config.crf <= 20
-                        ? '(High Quality)'
-                        : config.crf <= 24
-                        ? '(Balanced)'
-                        : '(Smaller File)'}
-                    </span>
-                    <span className="text-slate-500 font-mono">Lower = Higher Quality</span>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Color Depth</label>
+                    <select
+                      value={config.pixelFormat}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          pixelFormat: e.target.value as UpscaleConfig['pixelFormat'],
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                    >
+                      <option value="yuv420p">8-bit YUV420p</option>
+                      <option value="yuv420p10le">10-bit HDR</option>
+                    </select>
                   </div>
-                  <input
-                    type="range"
-                    min={10}
-                    max={34}
-                    step={1}
-                    value={config.crf}
-                    onChange={(e) =>
-                      setConfig((prev) => ({ ...prev, crf: Number(e.target.value) }))
-                    }
-                    className="w-full accent-indigo-500"
-                  />
-                </div>
-              ) : (
-                <div className="bg-slate-950/70 border border-slate-800/80 rounded-xl p-3">
-                  <div className="flex justify-between text-xs mb-1">
-                    <span className="text-slate-300">Target Video Bitrate</span>
-                    <span className="text-indigo-400 font-mono font-bold">
-                      {config.targetBitrateMbps} Mbps
-                    </span>
+
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">Audio</label>
+                    <select
+                      value={config.audioMode}
+                      onChange={(e) =>
+                        setConfig((prev) => ({
+                          ...prev,
+                          audioMode: e.target.value as UpscaleConfig['audioMode'],
+                        }))
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
+                    >
+                      <option value="copy">Copy Original</option>
+                      <option value="aac_192">AAC 192k</option>
+                      <option value="aac_320">AAC 320k</option>
+                      <option value="mute">Mute (-an)</option>
+                    </select>
                   </div>
-                  <input
-                    type="range"
-                    min={2}
-                    max={120}
-                    step={1}
-                    value={config.targetBitrateMbps}
-                    onChange={(e) =>
-                      setConfig((prev) => ({
-                        ...prev,
-                        targetBitrateMbps: Number(e.target.value),
-                      }))
-                    }
-                    className="w-full accent-indigo-500"
-                  />
                 </div>
-              )}
-            </div>
-
-            {/* Frame Rate, Speed Preset, Pixel Format & Audio */}
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Frame Rate (FPS)</label>
-                <select
-                  value={config.fps}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      fps: e.target.value as UpscaleConfig['fps'],
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
-                >
-                  <option value="source">Keep Source FPS</option>
-                  <option value="24">24 fps (Cinema)</option>
-                  <option value="30">30 fps (Standard)</option>
-                  <option value="60">60 fps (Smooth 60p)</option>
-                  <option value="120">120 fps (High Frame Rate)</option>
-                </select>
               </div>
+            )}
+          </div>
 
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Encoder Speed Preset</label>
-                <select
-                  value={config.preset}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      preset: e.target.value as UpscaleConfig['preset'],
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
-                >
-                  <option value="ultrafast">Ultrafast (Lowest CPU)</option>
-                  <option value="veryfast">Veryfast</option>
-                  <option value="fast">Fast (Recommended)</option>
-                  <option value="medium">Medium (Balanced)</option>
-                  <option value="slow">Slow (Best Compression)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Color Depth / PixFmt</label>
-                <select
-                  value={config.pixelFormat}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      pixelFormat: e.target.value as UpscaleConfig['pixelFormat'],
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
-                >
-                  <option value="yuv420p">8-bit YUV 4:2:0 (Universal compatibility)</option>
-                  <option value="yuv420p10le">10-bit YUV 4:2:0 (HDR / Smooth Gradients)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-400 mb-1">Audio Track</label>
-                <select
-                  value={config.audioMode}
-                  onChange={(e) =>
-                    setConfig((prev) => ({
-                      ...prev,
-                      audioMode: e.target.value as UpscaleConfig['audioMode'],
-                    }))
-                  }
-                  className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white"
-                >
-                  <option value="copy">Stream Copy (Lossless Fast)</option>
-                  <option value="aac_192">AAC 192 kbps Stereo</option>
-                  <option value="aac_320">AAC 320 kbps Studio</option>
-                  <option value="mute">Remove Audio (-an)</option>
-                </select>
-              </div>
-            </div>
-
-            {/* Primary Action Button */}
+          {/* Persistent Bottom Render CTA Footer */}
+          <div className="p-4 border-t border-slate-800/80 bg-slate-950/90">
             <button
               type="button"
               disabled={!video || job?.status === 'processing'}
               onClick={handleStartUpscale}
-              className="w-full py-3.5 px-5 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-sm shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 transition cursor-pointer"
+              className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-xs shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 transition cursor-pointer"
             >
               {job?.status === 'processing' ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Rendering {config.width}×{config.height} ({job.progress}%)...
+                  Rendering {effectiveOutW}×{effectiveOutH} ({job.progress}%)...
                 </>
               ) : (
                 <>
                   <Zap className="w-4 h-4" />
-                  Upscale & Render to {config.width}×{config.height} ({config.container.toUpperCase()})
+                  Render {effectiveOutW}×{effectiveOutH} ({config.container.toUpperCase()})
                 </>
               )}
             </button>
-          </section>
-        </div>
+          </div>
+        </aside>
       </main>
     </div>
   );

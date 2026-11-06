@@ -12,6 +12,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.10",
+    "@ffmpeg/util": "^0.12.1",
     "@tailwindcss/vite": "^4.1.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
