@@ -113,6 +113,22 @@ export interface UpscaleConfig {
   container: 'mp4' | 'mov' | 'mkv' | 'webm';
 }
 
+export type TransitionType =
+  | 'fade'
+  | 'fadeblack'
+  | 'fadewhite'
+  | 'wipeleft'
+  | 'wiperight'
+  | 'slideleft'
+  | 'slideright'
+  | 'circleopen'
+  | 'circleclose'
+  | 'dissolve'
+  | 'pixelize'
+  | 'radial'
+  | 'smoothleft'
+  | 'smoothright';
+
 export interface ResolutionPreset {
   id: string;
   label: string;

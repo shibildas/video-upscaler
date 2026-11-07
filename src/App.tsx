@@ -30,6 +30,10 @@ import {
   ChevronDown,
   ChevronUp,
   SunMedium,
+  Layers,
+  Plus,
+  ArrowLeft,
+  ArrowRight,
 } from 'lucide-react';
 import {
   ResolutionPreset,
@@ -37,6 +41,7 @@ import {
   UpscaleConfig,
   JobState,
   WatermarkBox,
+  TransitionType,
 } from './types';
 import { VideoComparePlayer } from './components/VideoComparePlayer';
 import { VideoTimelineEditor } from './components/VideoTimelineEditor';
@@ -122,7 +127,7 @@ function toEven(n: number): number {
   return v % 2 === 0 ? v : v + 1;
 }
 
-type InspectorTab = 'geometry' | 'enhance' | 'cleanup' | 'export';
+type InspectorTab = 'geometry' | 'enhance' | 'cleanup' | 'merge' | 'export';
 
 export default function App() {
   const [systemInfo, setSystemInfo] = useState<{
@@ -133,6 +138,9 @@ export default function App() {
   const [fingerprint, setFingerprint] = useState<string>('');
 
   const [video, setVideo] = useState<UploadedVideo | null>(null);
+  const [clipQueue, setClipQueue] = useState<UploadedVideo[]>([]);
+  const [transitionType, setTransitionType] = useState<TransitionType>('fade');
+  const [transitionDuration, setTransitionDuration] = useState<number>(1.0);
   const [playheadTime, setPlayheadTime] = useState<number>(0);
   const [seekTarget, setSeekTarget] = useState<number | null>(null);
   const [isUploading, setIsUploading] = useState(false);
@@ -196,6 +204,7 @@ export default function App() {
   const [job, setJob] = useState<JobState | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const addClipsInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     getBrowserFingerprint().then((fp) => setFingerprint(fp));
@@ -436,71 +445,186 @@ export default function App() {
     }
   };
 
-  const handleFileUpload = async (file: File) => {
+  const handleFilesSelected = async (
+    fileList: FileList | File[],
+    appendToQueue = false
+  ) => {
+    const files = Array.from(fileList);
+    if (files.length === 0) return;
+
     setIsUploading(true);
     setUploadError(null);
-    const prevFileId = video?.fileId;
-    const prevJobId = job?.jobId;
     setJob(null);
 
     try {
       const fp = fingerprint || (await getBrowserFingerprint());
-      const formData = new FormData();
-      if (prevFileId) formData.append('previousFileId', prevFileId);
-      if (prevJobId) formData.append('previousJobId', prevJobId);
-      formData.append('fingerprint', fp);
-      formData.append('video', file);
 
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        headers: { 'x-browser-fingerprint': fp },
-        body: formData,
-      });
-      const data: UploadedVideo = await res.json();
-      if (!res.ok) throw new Error((data as any).error || 'Upload failed');
-      setVideo(data);
-      setPlayheadTime(0);
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      if (files.length > 1 || appendToQueue) {
+        const formData = new FormData();
+        const keepIds = appendToQueue ? clipQueue.map((c) => c.fileId) : [];
+        formData.append('keepFileIds', JSON.stringify(keepIds));
+        formData.append('fingerprint', fp);
+        for (const f of files) {
+          formData.append('videos', f);
+        }
 
-      if (data.metadata.width && data.metadata.height) {
-        const isSourcePortrait = data.metadata.height > data.metadata.width;
-        const vrInfo = data.metadata.vr360;
-        const detectedProj =
-          vrInfo?.projection === 'hequirectangular'
-            ? 'hequirect'
-            : vrInfo?.projection === 'cubemap'
-            ? 'cubemap'
-            : vrInfo?.projection === 'fisheye'
-            ? 'fisheye'
-            : 'e';
-        const detectedStereo = vrInfo?.stereoMode || 'mono';
-
-        setConfig((prev) => {
-          const isTargetPortrait = prev.height > prev.width;
-          return {
-            ...prev,
-            rotation: 0,
-            watermarkBoxes: [],
-            vrNormalizeEnabled: Boolean(vrInfo?.isVr360),
-            vrInputProjection: detectedProj,
-            vrStereoMode: detectedStereo,
-            vrYaw: 0,
-            vrPitch: 0,
-            vrRoll: 0,
-            width: isSourcePortrait !== isTargetPortrait ? prev.height : prev.width,
-            height: isSourcePortrait !== isTargetPortrait ? prev.width : prev.height,
-          };
+        const res = await fetch('/api/upload-multiple', {
+          method: 'POST',
+          headers: { 'x-browser-fingerprint': fp },
+          body: formData,
         });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Multi-file upload failed');
+        const uploadedClips: UploadedVideo[] = data.clips || [];
+        if (uploadedClips.length > 0) {
+          const nextQueue = appendToQueue
+            ? [...clipQueue, ...uploadedClips]
+            : uploadedClips;
+          setClipQueue(nextQueue);
+          setVideo(nextQueue[0]);
+          setPlayheadTime(0);
+          if (nextQueue.length >= 2) {
+            setActiveTab('merge');
+          }
+        }
+      } else {
+        const file = files[0];
+        const prevFileId = video?.fileId;
+        const prevJobId = job?.jobId;
+        const formData = new FormData();
+        if (prevFileId) formData.append('previousFileId', prevFileId);
+        if (prevJobId) formData.append('previousJobId', prevJobId);
+        formData.append('fingerprint', fp);
+        formData.append('video', file);
 
-        if (vrInfo?.isVr360) {
-          setActiveTab('cleanup');
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: { 'x-browser-fingerprint': fp },
+          body: formData,
+        });
+        const data: UploadedVideo = await res.json();
+        if (!res.ok) throw new Error((data as any).error || 'Upload failed');
+        setVideo(data);
+        setClipQueue([data]);
+        setPlayheadTime(0);
+
+        if (data.metadata.width && data.metadata.height) {
+          const isSourcePortrait = data.metadata.height > data.metadata.width;
+          const vrInfo = data.metadata.vr360;
+          const detectedProj =
+            vrInfo?.projection === 'hequirectangular'
+              ? 'hequirect'
+              : vrInfo?.projection === 'cubemap'
+              ? 'cubemap'
+              : vrInfo?.projection === 'fisheye'
+              ? 'fisheye'
+              : 'e';
+          const detectedStereo = vrInfo?.stereoMode || 'mono';
+
+          setConfig((prev) => {
+            const isTargetPortrait = prev.height > prev.width;
+            return {
+              ...prev,
+              rotation: 0,
+              watermarkBoxes: [],
+              vrNormalizeEnabled: Boolean(vrInfo?.isVr360),
+              vrInputProjection: detectedProj,
+              vrStereoMode: detectedStereo,
+              vrYaw: 0,
+              vrPitch: 0,
+              vrRoll: 0,
+              width: isSourcePortrait !== isTargetPortrait ? prev.height : prev.width,
+              height: isSourcePortrait !== isTargetPortrait ? prev.width : prev.height,
+            };
+          });
+
+          if (vrInfo?.isVr360) {
+            setActiveTab('cleanup');
+          }
         }
       }
+
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      if (addClipsInputRef.current) addClipsInputRef.current.value = '';
     } catch (err: any) {
-      setUploadError(err.message || 'Failed to upload video');
+      setUploadError(err.message || 'Failed to upload video(s)');
     } finally {
       setIsUploading(false);
     }
+  };
+
+  const handleMergeWithTransitions = async () => {
+    if (clipQueue.length < 2) return;
+    setUploadError(null);
+
+    try {
+      const fp = fingerprint || (await getBrowserFingerprint());
+      const res = await fetch('/api/merge-transitions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-browser-fingerprint': fp,
+        },
+        body: JSON.stringify({
+          fingerprint: fp,
+          fileIds: clipQueue.map((c) => c.fileId),
+          transition: transitionType,
+          transitionDuration,
+          width: effectiveOutW,
+          height: effectiveOutH,
+          fps: config.fps === 'source' ? 30 : Number(config.fps) || 30,
+          codec: config.codec,
+          crf: config.crf,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to start transition merge');
+
+      const totalDur = clipQueue.reduce((s, c) => s + (c.metadata.duration || 0), 0);
+      setJob({
+        jobId: data.jobId,
+        status: 'processing',
+        progress: 0,
+        fps: 0,
+        speed: '0x',
+        bitrate: '',
+        currentTimeSec: 0,
+        totalDurationSec: Math.max(1, totalDur),
+        command: data.command,
+        startedAt: Date.now(),
+        completedAt: null,
+        outputUrl: null,
+        outputFilename: '',
+        outputMetadata: null,
+        error: null,
+        logs: [],
+      });
+    } catch (err: any) {
+      setUploadError(err.message || 'Merge with transitions failed');
+    }
+  };
+
+  const moveClipInQueue = (index: number, direction: -1 | 1) => {
+    setClipQueue((prev) => {
+      const next = [...prev];
+      const targetIdx = index + direction;
+      if (targetIdx < 0 || targetIdx >= next.length) return prev;
+      const [item] = next.splice(index, 1);
+      next.splice(targetIdx, 0, item);
+      return next;
+    });
+  };
+
+  const removeClipFromQueue = (fileId: string) => {
+    setClipQueue((prev) => {
+      const next = prev.filter((c) => c.fileId !== fileId);
+      if (video?.fileId === fileId && next.length > 0) {
+        setVideo(next[0]);
+      } else if (next.length === 0) {
+        setVideo(null);
+      }
+      return next;
+    });
   };
 
   const handleAutoDetectWatermarks = async () => {
@@ -551,6 +675,7 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to generate sample video');
       setVideo(data);
+      setClipQueue([data]);
       setPlayheadTime(0);
     } catch (err: any) {
       setUploadError(err.message || 'Failed to generate sample video');
@@ -692,15 +817,35 @@ export default function App() {
             ref={fileInputRef}
             type="file"
             accept="video/*"
+            multiple
             className="hidden"
             onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) handleFileUpload(f);
+              if (e.target.files?.length) handleFilesSelected(e.target.files, false);
+            }}
+          />
+          <input
+            ref={addClipsInputRef}
+            type="file"
+            accept="video/*"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files?.length) handleFilesSelected(e.target.files, true);
             }}
           />
 
           {video && (
             <>
+              <button
+                type="button"
+                onClick={() => addClipsInputRef.current?.click()}
+                className="px-2.5 py-1.5 rounded-lg bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/40 text-indigo-200 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer"
+                title="Add more video files to merge with transitions"
+              >
+                <Plus className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Add Clips ({clipQueue.length})</span>
+              </button>
+
               <button
                 type="button"
                 onClick={() => setShowTimelineDrawer((s) => !s)}
@@ -769,8 +914,9 @@ export default function App() {
               onDragOver={(e) => e.preventDefault()}
               onDrop={(e) => {
                 e.preventDefault();
-                const f = e.dataTransfer.files?.[0];
-                if (f) handleFileUpload(f);
+                if (e.dataTransfer.files?.length) {
+                  handleFilesSelected(e.dataTransfer.files, false);
+                }
               }}
               className="border-2 border-dashed border-slate-800 hover:border-indigo-500/60 bg-[#0d1117]/80 rounded-2xl p-12 text-center transition flex flex-col items-center justify-center min-h-[480px]"
             >
@@ -782,10 +928,10 @@ export default function App() {
                 )}
               </div>
               <h2 className="text-xl font-bold text-white mb-1.5">
-                Drop a video to open in FrameScale Studio
+                Drop one or multiple videos into FrameScale Studio
               </h2>
               <p className="text-sm text-slate-400 max-w-md mb-6">
-                Upscale up to 4K UHD & 7200px, enhance clarity & color in real time, remove watermarks, or unwrap 360° VR footage.
+                Select multiple files to merge with smooth transitions (`xfade`), upscale up to 4K UHD & 7200px, enhance clarity & color, or unwrap 360° VR footage.
               </p>
 
               <div className="flex flex-wrap items-center justify-center gap-3">
@@ -795,7 +941,7 @@ export default function App() {
                   onClick={() => fileInputRef.current?.click()}
                   className="px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold text-sm shadow-lg shadow-indigo-600/25 transition cursor-pointer"
                 >
-                  {isUploading ? 'Loading Media...' : 'Browse Video Files'}
+                  {isUploading ? 'Loading Media...' : 'Select Video File(s)'}
                 </button>
 
                 <button
@@ -874,6 +1020,179 @@ export default function App() {
                   {config.codec.replace('_videotoolbox', ' HW')} • {config.container.toUpperCase()}
                 </span>
               </div>
+
+              {/* Multi-Clip Storyboard & Transition Merge Bar */}
+              {clipQueue.length > 0 && (
+                <div className="bg-[#0d1117] border border-slate-800/90 rounded-2xl p-3.5 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Layers className="w-4 h-4 text-violet-400" />
+                      <span className="text-xs font-semibold text-white">
+                        Multi-Clip Storyboard ({clipQueue.length}{' '}
+                        {clipQueue.length === 1 ? 'clip' : 'clips'})
+                      </span>
+                      <span className="text-[11px] text-slate-400">
+                        Total:{' '}
+                        {clipQueue
+                          .reduce((acc, c) => acc + (c.metadata.duration || 0), 0)
+                          .toFixed(1)}
+                        s
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {clipQueue.length >= 2 && (
+                        <>
+                          <select
+                            value={transitionType}
+                            onChange={(e) =>
+                              setTransitionType(e.target.value as TransitionType)
+                            }
+                            className="px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-800 text-xs text-white"
+                            title="FFmpeg xfade transition style between clips"
+                          >
+                            <option value="fade">Transition: Crossfade</option>
+                            <option value="fadeblack">Dip to Black</option>
+                            <option value="fadewhite">Dip to White</option>
+                            <option value="dissolve">Film Dissolve</option>
+                            <option value="wipeleft">Wipe Left</option>
+                            <option value="wiperight">Wipe Right</option>
+                            <option value="slideleft">Slide Left</option>
+                            <option value="slideright">Slide Right</option>
+                            <option value="smoothleft">Smooth Push Left</option>
+                            <option value="smoothright">Smooth Push Right</option>
+                            <option value="circleopen">Circle Iris Open</option>
+                            <option value="circleclose">Circle Iris Close</option>
+                            <option value="radial">Radial Clock Wipe</option>
+                            <option value="pixelize">Pixelize Morph</option>
+                          </select>
+
+                          <div className="flex items-center gap-1 bg-slate-950 px-2 py-1 rounded-lg border border-slate-800 text-xs">
+                            <span className="text-slate-400">Dur:</span>
+                            <input
+                              type="number"
+                              min={0.2}
+                              max={3.5}
+                              step={0.2}
+                              value={transitionDuration}
+                              onChange={(e) =>
+                                setTransitionDuration(
+                                  Math.max(0.2, Math.min(3.5, Number(e.target.value) || 1.0))
+                                )
+                              }
+                              className="w-12 bg-transparent font-mono text-indigo-300 text-right focus:outline-none"
+                            />
+                            <span className="text-slate-500">s</span>
+                          </div>
+
+                          <button
+                            type="button"
+                            disabled={job?.status === 'processing'}
+                            onClick={handleMergeWithTransitions}
+                            className="px-3 py-1.5 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:opacity-40 text-white text-xs font-semibold shadow-md shadow-violet-600/20 flex items-center gap-1.5 transition cursor-pointer"
+                          >
+                            <Sparkles className="w-3.5 h-3.5" />
+                            Merge {clipQueue.length} Clips ({transitionType})
+                          </button>
+                        </>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => addClipsInputRef.current?.click()}
+                        className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 border border-slate-700 flex items-center gap-1 transition cursor-pointer"
+                      >
+                        <Plus className="w-3.5 h-3.5 text-indigo-400" />
+                        Add File
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Horizontal Storyboard Strip */}
+                  <div className="flex items-center gap-2 overflow-x-auto pb-1">
+                    {clipQueue.map((item, idx) => {
+                      const isActive = item.fileId === video.fileId;
+                      return (
+                        <React.Fragment key={item.fileId}>
+                          <div
+                            onClick={() => {
+                              setVideo(item);
+                              setPlayheadTime(0);
+                            }}
+                            className={`group relative shrink-0 w-48 p-2.5 rounded-xl border transition cursor-pointer ${
+                              isActive
+                                ? 'bg-indigo-600/15 border-indigo-500 text-white'
+                                : 'bg-slate-950/80 border-slate-800 text-slate-300 hover:border-slate-700'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-1 mb-1">
+                              <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] font-mono text-indigo-300">
+                                #{idx + 1}
+                              </span>
+                              <div className="flex items-center gap-0.5 opacity-80 group-hover:opacity-100">
+                                {idx > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      moveClipInQueue(idx, -1);
+                                    }}
+                                    className="p-0.5 hover:text-indigo-400 cursor-pointer"
+                                    title="Move Left"
+                                  >
+                                    <ArrowLeft className="w-3 h-3" />
+                                  </button>
+                                )}
+                                {idx < clipQueue.length - 1 && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      moveClipInQueue(idx, 1);
+                                    }}
+                                    className="p-0.5 hover:text-indigo-400 cursor-pointer"
+                                    title="Move Right"
+                                  >
+                                    <ArrowRight className="w-3 h-3" />
+                                  </button>
+                                )}
+                                {clipQueue.length > 1 && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      removeClipFromQueue(item.fileId);
+                                    }}
+                                    className="p-0.5 hover:text-rose-400 cursor-pointer"
+                                    title="Remove Clip"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                            <p className="text-xs font-medium truncate">
+                              {item.originalName}
+                            </p>
+                            <p className="text-[10px] font-mono text-slate-400 mt-0.5">
+                              {item.metadata.width}×{item.metadata.height} •{' '}
+                              {(item.metadata.duration || 0).toFixed(1)}s
+                            </p>
+                          </div>
+
+                          {/* Transition Connector Pill Between Clips */}
+                          {idx < clipQueue.length - 1 && (
+                            <div className="shrink-0 px-2 py-1 rounded-full bg-violet-500/15 border border-violet-500/30 text-[10px] font-mono text-violet-300 flex items-center gap-1">
+                              <span>⚡ {transitionType}</span>
+                              <span>({transitionDuration}s)</span>
+                            </div>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Active / Completed Render Progress Banner */}
               {job && (
@@ -1000,8 +1319,8 @@ export default function App() {
 
         {/* Right 4 Columns: Unified Tabbed Inspector Panel */}
         <aside className="lg:col-span-4 bg-[#0d1117] border border-slate-800/90 rounded-2xl overflow-hidden shadow-2xl flex flex-col lg:sticky lg:top-18">
-          {/* 4-Tab Segmented Navigation */}
-          <div className="grid grid-cols-4 p-1.5 bg-slate-950/90 border-b border-slate-800/80 gap-1">
+          {/* 5-Tab Segmented Navigation */}
+          <div className="grid grid-cols-5 p-1.5 bg-slate-950/90 border-b border-slate-800/80 gap-1">
             {(
               [
                 { id: 'geometry', label: 'Scale', icon: Maximize2 },
@@ -1013,6 +1332,12 @@ export default function App() {
                   alert: Boolean(
                     video?.metadata.vr360?.isVr360 || config.watermarkEnabled
                   ),
+                },
+                {
+                  id: 'merge',
+                  label: 'Merge',
+                  icon: Layers,
+                  alert: clipQueue.length >= 2,
                 },
                 { id: 'export', label: 'Codec', icon: Cpu },
               ] as const
@@ -1790,7 +2115,197 @@ export default function App() {
               </div>
             )}
 
-            {/* TAB 4: CODEC, BITRATE & CONTAINER */}
+            {/* TAB 4: MULTI-FILE MERGE & TRANSITIONS */}
+            {activeTab === 'merge' && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-xs font-semibold text-white">
+                      Multi-File Merge & Transitions
+                    </h3>
+                    <p className="text-[11px] text-slate-400">
+                      Combine multiple clips with FFmpeg `xfade` & `acrossfade`
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => addClipsInputRef.current?.click()}
+                    className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow transition cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    Add Files
+                  </button>
+                </div>
+
+                {/* Transition Style & Duration Controls */}
+                <div className="bg-slate-950/70 border border-slate-800/90 rounded-xl p-3.5 space-y-3">
+                  <div>
+                    <label className="block text-xs text-slate-400 mb-1">
+                      Transition Effect (`xfade`)
+                    </label>
+                    <select
+                      value={transitionType}
+                      onChange={(e) =>
+                        setTransitionType(e.target.value as TransitionType)
+                      }
+                      className="w-full px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white"
+                    >
+                      <option value="fade">Crossfade (Smooth Blend)</option>
+                      <option value="fadeblack">Dip to Black</option>
+                      <option value="fadewhite">Dip to White</option>
+                      <option value="dissolve">Film Dissolve</option>
+                      <option value="wipeleft">Wipe Left</option>
+                      <option value="wiperight">Wipe Right</option>
+                      <option value="slideleft">Slide Left</option>
+                      <option value="slideright">Slide Right</option>
+                      <option value="smoothleft">Smooth Push Left</option>
+                      <option value="smoothright">Smooth Push Right</option>
+                      <option value="circleopen">Circle Iris Open</option>
+                      <option value="circleclose">Circle Iris Close</option>
+                      <option value="radial">Radial Clock Wipe</option>
+                      <option value="pixelize">Pixelize Morph</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className="text-slate-300">Transition Overlap Duration</span>
+                      <span className="font-mono text-indigo-400">
+                        {transitionDuration.toFixed(1)}s
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0.2}
+                      max={3.5}
+                      step={0.1}
+                      value={transitionDuration}
+                      onChange={(e) =>
+                        setTransitionDuration(parseFloat(e.target.value) || 1.0)
+                      }
+                      className="w-full accent-indigo-500"
+                    />
+                  </div>
+                </div>
+
+                {/* Selected Clips Queue List */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs text-slate-400">
+                    <span>Selected Clips ({clipQueue.length})</span>
+                    <span>
+                      Total:{' '}
+                      {clipQueue
+                        .reduce((acc, c) => acc + (c.metadata.duration || 0), 0)
+                        .toFixed(1)}
+                      s
+                    </span>
+                  </div>
+
+                  {clipQueue.length === 0 ? (
+                    <div
+                      onClick={() => fileInputRef.current?.click()}
+                      className="p-6 rounded-xl border border-dashed border-slate-800 hover:border-indigo-500/50 text-center cursor-pointer"
+                    >
+                      <p className="text-xs text-slate-400">
+                        Click to select 2 or more video files to merge
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5 max-h-60 overflow-y-auto pr-1">
+                      {clipQueue.map((item, idx) => (
+                        <div
+                          key={item.fileId}
+                          onClick={() => {
+                            setVideo(item);
+                            setPlayheadTime(0);
+                          }}
+                          className={`flex items-center justify-between gap-2 p-2.5 rounded-xl border text-xs cursor-pointer transition ${
+                            item.fileId === video?.fileId
+                              ? 'bg-indigo-600/15 border-indigo-500 text-white'
+                              : 'bg-slate-950 border-slate-800 text-slate-300'
+                          }`}
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] font-mono text-indigo-300 shrink-0">
+                              #{idx + 1}
+                            </span>
+                            <div className="min-w-0">
+                              <p className="font-medium truncate">{item.originalName}</p>
+                              <p className="text-[10px] font-mono text-slate-400">
+                                {item.metadata.width}×{item.metadata.height} •{' '}
+                                {(item.metadata.duration || 0).toFixed(1)}s
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1 shrink-0">
+                            {idx > 0 && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  moveClipInQueue(idx, -1);
+                                }}
+                                className="p-1 rounded bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white cursor-pointer"
+                                title="Move Up"
+                              >
+                                <ChevronUp className="w-3 h-3" />
+                              </button>
+                            )}
+                            {idx < clipQueue.length - 1 && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  moveClipInQueue(idx, 1);
+                                }}
+                                className="p-1 rounded bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white cursor-pointer"
+                                title="Move Down"
+                              >
+                                <ChevronDown className="w-3 h-3" />
+                              </button>
+                            )}
+                            {clipQueue.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  removeClipFromQueue(item.fileId);
+                                }}
+                                className="p-1 rounded bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 cursor-pointer"
+                                title="Remove Clip"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {clipQueue.length === 1 && (
+                    <p className="text-[11px] text-amber-300/90 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2">
+                      Add at least 1 more video clip using <strong>+ Add Files</strong> above to enable transition merging.
+                    </p>
+                  )}
+
+                  {clipQueue.length >= 2 && (
+                    <button
+                      type="button"
+                      disabled={job?.status === 'processing'}
+                      onClick={handleMergeWithTransitions}
+                      className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:opacity-40 text-white font-semibold text-xs shadow-lg shadow-violet-600/25 flex items-center justify-center gap-2 transition cursor-pointer"
+                    >
+                      <Sparkles className="w-4 h-4" />
+                      Merge {clipQueue.length} Clips with {transitionType} ({transitionDuration}s)
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* TAB 5: CODEC, BITRATE & CONTAINER */}
             {activeTab === 'export' && (
               <div className="space-y-3.5">
                 <div>
@@ -1997,13 +2512,22 @@ export default function App() {
             <button
               type="button"
               disabled={!video || job?.status === 'processing'}
-              onClick={handleStartUpscale}
+              onClick={
+                activeTab === 'merge' && clipQueue.length >= 2
+                  ? handleMergeWithTransitions
+                  : handleStartUpscale
+              }
               className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold text-xs shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 transition cursor-pointer"
             >
               {job?.status === 'processing' ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
                   Rendering {effectiveOutW}×{effectiveOutH} ({job.progress}%)...
+                </>
+              ) : activeTab === 'merge' && clipQueue.length >= 2 ? (
+                <>
+                  <Layers className="w-4 h-4" />
+                  Merge {clipQueue.length} Clips ({transitionType} • {effectiveOutW}×{effectiveOutH})
                 </>
               ) : (
                 <>

@@ -136,7 +136,14 @@ function cleanupClientResources({
 
   // 4. Delete old uploaded source files belonging to this browser fingerprint (unless clearOutputsOnly)
   if (!clearOutputsOnly) {
-    if (safeFileId && safeFileId !== keepUploadFilename) {
+    const keepSet = new Set(
+      Array.isArray(keepUploadFilename)
+        ? keepUploadFilename
+        : keepUploadFilename
+        ? [keepUploadFilename]
+        : []
+    );
+    if (safeFileId && !keepSet.has(safeFileId)) {
       safeUnlink(UPLOADS_DIR, safeFileId);
     }
     if (fpPrefix) {
@@ -144,7 +151,7 @@ function cleanupClientResources({
         for (const file of fs.readdirSync(UPLOADS_DIR)) {
           if (
             file.startsWith(fpPrefix) &&
-            file !== keepUploadFilename &&
+            !keepSet.has(file) &&
             file !== '.gitkeep'
           ) {
             safeUnlink(UPLOADS_DIR, file);
@@ -897,6 +904,274 @@ app.post('/api/upload', upload.single('video'), async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Failed to inspect uploaded video' });
+  }
+});
+
+/**
+ * POST /api/upload-multiple
+ * Upload multiple video files at once for multi-clip merging with transitions
+ */
+app.post('/api/upload-multiple', upload.array('videos', 20), async (req, res) => {
+  try {
+    const files = req.files;
+    if (!files || !Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: 'No video files provided' });
+    }
+
+    const fp = getRequestFingerprint(req);
+    let keepExisting = [];
+    if (req.body?.keepFileIds) {
+      try {
+        keepExisting = JSON.parse(req.body.keepFileIds);
+      } catch {
+        keepExisting = [];
+      }
+    }
+
+    const uploadedNames = files.map((f) => f.filename);
+    cleanupClientResources({
+      fingerprint: fp,
+      keepUploadFilename: [...keepExisting, ...uploadedNames],
+      clearOutputsOnly: false,
+    });
+
+    const clips = [];
+    for (const f of files) {
+      const metadata = await probeVideo(f.path);
+      clips.push({
+        fileId: f.filename,
+        originalName: f.originalname,
+        fingerprint: fp,
+        url: `/uploads/${f.filename}`,
+        metadata,
+      });
+    }
+
+    res.json({ clips });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to inspect uploaded videos' });
+  }
+});
+
+/**
+ * POST /api/merge-transitions
+ * Merges 2 or more uploaded video files into a single continuous MP4 using FFmpeg's `xfade`
+ * video transition filter and `acrossfade` audio transition filter (or seamless concat if transition === 'none'),
+ * normalizing all clips to the target resolution & frame rate.
+ */
+app.post('/api/merge-transitions', async (req, res) => {
+  try {
+    const {
+      fileIds = [],
+      transition = 'fade',
+      transitionDuration = 1.0,
+      width = 1920,
+      height = 1080,
+      fps = 30,
+      codec = 'libx264',
+      crf = 18,
+    } = req.body || {};
+
+    if (!Array.isArray(fileIds) || fileIds.length < 2) {
+      return res.status(400).json({ error: 'Select at least 2 video clips to merge with transitions' });
+    }
+
+    const fp = getRequestFingerprint(req);
+    const inputPaths = [];
+    const metas = [];
+
+    for (const fid of fileIds) {
+      const p = path.join(UPLOADS_DIR, path.basename(fid));
+      if (!fs.existsSync(p)) {
+        return res.status(404).json({ error: `Clip not found on server: ${fid}` });
+      }
+      inputPaths.push(p);
+      metas.push(await probeVideo(p));
+    }
+
+    const targetW = toEven(width || metas[0].width || 1920);
+    const targetH = toEven(height || metas[0].height || 1080);
+    const targetFps = Number(fps) || 30;
+    const transDur = Math.max(0.2, Math.min(4.0, Number(transitionDuration) || 1.0));
+
+    // Ensure transition duration does not exceed half of the shortest clip
+    const minClipDur = Math.min(...metas.map((m) => Math.max(1.0, m.duration || 3)));
+    const safeTransDur = Math.min(transDur, Number((minClipDur * 0.45).toFixed(2)));
+
+    const jobId = crypto.randomUUID();
+    const shortId = jobId.slice(0, 8);
+    const outputFilename = `${fp}_merged_${transition}_${targetW}x${targetH}_${Date.now()}_${shortId}.mp4`;
+    const outputPath = path.join(OUTPUTS_DIR, outputFilename);
+
+    const args = ['-y', '-hide_banner'];
+    for (const p of inputPaths) {
+      args.push('-i', p);
+    }
+
+    // Build filter_complex:
+    // 1) Normalize each input stream [i:v] to targetW x targetH, SAR 1:1, targetFps, yuv420p, and timebase
+    const filterParts = [];
+    for (let i = 0; i < inputPaths.length; i++) {
+      filterParts.push(
+        `[${i}:v]scale=${targetW}:${targetH}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${targetW}:${targetH}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=${targetFps},format=yuv420p,settb=AVTB[v${i}]`
+      );
+    }
+
+    // 2) Chain xfade transitions between [v0], [v1], [v2]...
+    let cumulativeOffset = metas[0].duration - safeTransDur;
+    let prevVideoLabel = 'v0';
+
+    for (let i = 1; i < inputPaths.length; i++) {
+      const outLabel = i === inputPaths.length - 1 ? 'vout' : `vx${i}`;
+      const offset = Math.max(0.1, Number(cumulativeOffset.toFixed(3)));
+      filterParts.push(
+        `[${prevVideoLabel}][v${i}]xfade=transition=${transition}:duration=${safeTransDur}:offset=${offset}[${outLabel}]`
+      );
+      prevVideoLabel = outLabel;
+      if (i < inputPaths.length - 1) {
+        cumulativeOffset += metas[i].duration - safeTransDur;
+      }
+    }
+
+    // 3) Check if all clips have audio streams; if so, chain acrossfade, otherwise generate silent or video-only
+    const allHaveAudio = metas.every((m) => m.hasAudio);
+    if (allHaveAudio) {
+      for (let i = 0; i < inputPaths.length; i++) {
+        filterParts.push(
+          `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}]`
+        );
+      }
+      let prevAudioLabel = 'a0';
+      for (let i = 1; i < inputPaths.length; i++) {
+        const outAudioLabel = i === inputPaths.length - 1 ? 'aout' : `ax${i}`;
+        filterParts.push(
+          `[${prevAudioLabel}][a${i}]acrossfade=d=${safeTransDur}:c1=tri:c2=tri[${outAudioLabel}]`
+        );
+        prevAudioLabel = outAudioLabel;
+      }
+    }
+
+    args.push('-filter_complex', filterParts.join(';'));
+    args.push('-map', '[vout]');
+    if (allHaveAudio) {
+      args.push('-map', '[aout]', '-c:a', 'aac', '-b:a', '192k');
+    } else {
+      args.push('-an');
+    }
+
+    args.push('-c:v', codec);
+    if (codec === 'libx264' || codec === 'libx265') {
+      args.push('-preset', 'fast', '-crf', String(crf));
+      if (codec === 'libx265') args.push('-tag:v', 'hvc1');
+    } else if (codec.includes('videotoolbox')) {
+      args.push('-b:v', '18M');
+    }
+
+    args.push('-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', outputPath);
+
+    const totalExpectedDuration =
+      metas.reduce((acc, m) => acc + (m.duration || 0), 0) -
+      safeTransDur * (inputPaths.length - 1);
+
+    const cliPreview = `ffmpeg ${args
+      .filter((a) => a !== '-progress' && a !== 'pipe:1' && a !== '-nostats')
+      .map((a) => (a.includes(' ') || a.includes(';') || a.includes('[') ? `"${a}"` : a))
+      .join(' ')}`;
+
+    const child = spawn('ffmpeg', args);
+
+    const jobState = {
+      jobId,
+      fingerprint: fp,
+      sourceFileId: path.basename(fileIds[0]),
+      status: 'processing',
+      progress: 0,
+      fps: 0,
+      speed: '0x',
+      bitrate: '',
+      currentTimeSec: 0,
+      totalDurationSec: Math.max(1, totalExpectedDuration),
+      command: cliPreview,
+      startedAt: Date.now(),
+      completedAt: null,
+      outputUrl: null,
+      outputFilename,
+      outputMetadata: null,
+      error: null,
+      logs: [],
+      process: child,
+    };
+
+    jobs.set(jobId, jobState);
+
+    let stdoutBuffer = '';
+    child.stdout.on('data', (chunk) => {
+      stdoutBuffer += chunk.toString();
+      const lines = stdoutBuffer.split('\n');
+      stdoutBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const [key, val] = line.trim().split('=');
+        if (!key || val === undefined) continue;
+
+        if (key === 'out_time_us' || key === 'out_time_ms') {
+          const us = parseInt(val, 10);
+          if (!Number.isNaN(us) && us >= 0) {
+            const sec = us / 1_000_000;
+            jobState.currentTimeSec = sec;
+            if (jobState.totalDurationSec > 0) {
+              jobState.progress = Math.min(
+                99,
+                Math.round((sec / jobState.totalDurationSec) * 100)
+              );
+            }
+          }
+        } else if (key === 'fps') {
+          jobState.fps = parseFloat(val) || 0;
+        } else if (key === 'speed') {
+          jobState.speed = val.trim();
+        } else if (key === 'bitrate') {
+          jobState.bitrate = val.trim();
+        } else if (key === 'progress' && val.trim() === 'end') {
+          jobState.progress = 100;
+        }
+      }
+    });
+
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString().trim();
+      if (text) {
+        jobState.logs.push(text);
+        if (jobState.logs.length > 60) jobState.logs.shift();
+      }
+    });
+
+    child.on('close', async (code) => {
+      jobState.process = null;
+      if (code === 0 && fs.existsSync(outputPath)) {
+        try {
+          jobState.outputMetadata = await probeVideo(outputPath);
+        } catch (_e) {
+          // ignore
+        }
+        jobState.status = 'completed';
+        jobState.progress = 100;
+        jobState.completedAt = Date.now();
+        jobState.outputUrl = `/outputs/${outputFilename}`;
+      } else if (jobState.status !== 'cancelled') {
+        jobState.status = 'failed';
+        jobState.error =
+          jobState.logs.slice(-4).join('\n') || `FFmpeg merge exited with code ${code}`;
+      }
+    });
+
+    res.json({
+      jobId,
+      status: 'processing',
+      command: cliPreview,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to start multi-clip merge job' });
   }
 });
 
