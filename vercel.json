@@ -3,6 +3,9 @@
   "framework": "vite",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
+  "git": {
+    "deploymentEnabled": true
+  },
   "rewrites": [
     {
       "source": "/((?!api/|assets/|.*\\..*).*)",
