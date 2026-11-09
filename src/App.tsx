@@ -46,6 +46,15 @@ import {
 import { VideoComparePlayer } from './components/VideoComparePlayer';
 import { VideoTimelineEditor } from './components/VideoTimelineEditor';
 import { getBrowserFingerprint } from './utils/fingerprint';
+import {
+  probeVideoFileInBrowser,
+  buildBrowserCliCommand,
+  renderBrowserLivePreviewFrame,
+  detectWatermarksInBrowser,
+  generateDemoVideoInBrowser,
+  processVideoInBrowser,
+  mergeClipsWithTransitionsInBrowser,
+} from './utils/ffmpegBrowser';
 
 const RESOLUTION_PRESETS: ResolutionPreset[] = [
   {
@@ -209,28 +218,37 @@ export default function App() {
   useEffect(() => {
     getBrowserFingerprint().then((fp) => setFingerprint(fp));
     fetch('/api/system-info')
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error('Backend unavailable');
+        return r.json();
+      })
       .then((data) => setSystemInfo(data))
       .catch(() => setSystemInfo({ available: false }));
   }, []);
 
-  // Update live FFmpeg CLI preview
+  // Update live FFmpeg CLI preview (uses server when available, browser generator on Vercel)
   useEffect(() => {
+    const fileName = video?.originalName || 'input.mp4';
+    const localCmd = buildBrowserCliCommand(fileName, config, video?.metadata || null);
+    setCliCommand(localCmd);
+
+    if (!systemInfo?.available) return;
+
     fetch('/api/preview-command', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        fileId: video?.originalName || 'input.mp4',
+        fileId: fileName,
         config,
         sourceMeta: video?.metadata || null,
       }),
     })
-      .then((r) => r.json())
+      .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (data.command) setCliCommand(data.command);
+        if (data?.command) setCliCommand(data.command);
       })
       .catch(() => {});
-  }, [config, video]);
+  }, [config, video, systemInfo?.available]);
 
   // Real-time debounced FFmpeg live frame preview whenever filter settings or playhead changes
   useEffect(() => {
@@ -238,24 +256,42 @@ export default function App() {
       return;
     }
 
+    let cancelled = false;
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       setIsLivePreviewLoading(true);
       try {
-        const res = await fetch('/api/live-preview-frame', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            fileId: video.fileId,
-            timestamp: playheadTime,
-            config,
-            sourceMeta: video.metadata,
-          }),
-        });
-        if (res.ok) {
-          const blob = await res.blob();
-          const nextUrl = URL.createObjectURL(blob);
+        if (systemInfo?.available && !video.fileId.startsWith('browser_')) {
+          const res = await fetch('/api/live-preview-frame', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              fileId: video.fileId,
+              timestamp: playheadTime,
+              config,
+              sourceMeta: video.metadata,
+            }),
+          });
+          if (res.ok && !cancelled) {
+            const blob = await res.blob();
+            const nextUrl = URL.createObjectURL(blob);
+            setLivePreviewUrl((prev) => {
+              if (prev) URL.revokeObjectURL(prev);
+              return nextUrl;
+            });
+            return;
+          }
+        }
+
+        // Client-side HTML5 Canvas live frame preview fallback (Vercel / Browser WASM mode)
+        const nextUrl = await renderBrowserLivePreviewFrame(
+          video.url,
+          playheadTime,
+          config,
+          video.metadata
+        );
+        if (nextUrl && !cancelled) {
           setLivePreviewUrl((prev) => {
             if (prev) URL.revokeObjectURL(prev);
             return nextUrl;
@@ -264,16 +300,19 @@ export default function App() {
       } catch (_e) {
         // ignore aborted preview requests
       } finally {
-        setIsLivePreviewLoading(false);
+        if (!cancelled) setIsLivePreviewLoading(false);
       }
     }, 180);
 
     return () => {
+      cancelled = true;
       clearTimeout(timer);
       controller.abort();
     };
   }, [
     video?.fileId,
+    video?.url,
+    systemInfo?.available,
     livePreviewEnabled,
     job?.outputUrl,
     playheadTime,
@@ -307,9 +346,9 @@ export default function App() {
     config.vrRoll,
   ]);
 
-  // Poll active FFmpeg job progress
+  // Poll active FFmpeg job progress (server jobs only; browser WASM jobs push updates directly)
   useEffect(() => {
-    if (!job || job.status !== 'processing') return;
+    if (!job || job.status !== 'processing' || job.jobId.startsWith('browser_')) return;
 
     const timer = setInterval(async () => {
       try {
@@ -445,6 +484,43 @@ export default function App() {
     }
   };
 
+  const applyDetectedVideoConfig = (data: UploadedVideo) => {
+    if (data.metadata.width && data.metadata.height) {
+      const isSourcePortrait = data.metadata.height > data.metadata.width;
+      const vrInfo = data.metadata.vr360;
+      const detectedProj =
+        vrInfo?.projection === 'hequirectangular'
+          ? 'hequirect'
+          : vrInfo?.projection === 'cubemap'
+          ? 'cubemap'
+          : vrInfo?.projection === 'fisheye'
+          ? 'fisheye'
+          : 'e';
+      const detectedStereo = vrInfo?.stereoMode || 'mono';
+
+      setConfig((prev) => {
+        const isTargetPortrait = prev.height > prev.width;
+        return {
+          ...prev,
+          rotation: 0,
+          watermarkBoxes: [],
+          vrNormalizeEnabled: Boolean(vrInfo?.isVr360),
+          vrInputProjection: detectedProj,
+          vrStereoMode: detectedStereo,
+          vrYaw: 0,
+          vrPitch: 0,
+          vrRoll: 0,
+          width: isSourcePortrait !== isTargetPortrait ? prev.height : prev.width,
+          height: isSourcePortrait !== isTargetPortrait ? prev.width : prev.height,
+        };
+      });
+
+      if (vrInfo?.isVr360) {
+        setActiveTab('cleanup');
+      }
+    }
+  };
+
   const handleFilesSelected = async (
     fileList: FileList | File[],
     appendToQueue = false
@@ -460,22 +536,35 @@ export default function App() {
       const fp = fingerprint || (await getBrowserFingerprint());
 
       if (files.length > 1 || appendToQueue) {
-        const formData = new FormData();
-        const keepIds = appendToQueue ? clipQueue.map((c) => c.fileId) : [];
-        formData.append('keepFileIds', JSON.stringify(keepIds));
-        formData.append('fingerprint', fp);
-        for (const f of files) {
-          formData.append('videos', f);
+        let uploadedClips: UploadedVideo[] = [];
+
+        if (systemInfo?.available) {
+          try {
+            const formData = new FormData();
+            const keepIds = appendToQueue ? clipQueue.map((c) => c.fileId) : [];
+            formData.append('keepFileIds', JSON.stringify(keepIds));
+            formData.append('fingerprint', fp);
+            for (const f of files) {
+              formData.append('videos', f);
+            }
+
+            const res = await fetch('/api/upload-multiple', {
+              method: 'POST',
+              headers: { 'x-browser-fingerprint': fp },
+              body: formData,
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Multi-file upload failed');
+            uploadedClips = data.clips || [];
+          } catch {
+            // Fallback to browser probing if server upload failed
+            uploadedClips = await Promise.all(files.map((f) => probeVideoFileInBrowser(f)));
+          }
+        } else {
+          // 100% Browser Client-Side Mode (Vercel)
+          uploadedClips = await Promise.all(files.map((f) => probeVideoFileInBrowser(f)));
         }
 
-        const res = await fetch('/api/upload-multiple', {
-          method: 'POST',
-          headers: { 'x-browser-fingerprint': fp },
-          body: formData,
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Multi-file upload failed');
-        const uploadedClips: UploadedVideo[] = data.clips || [];
         if (uploadedClips.length > 0) {
           const nextQueue = appendToQueue
             ? [...clipQueue, ...uploadedClips]
@@ -489,65 +578,44 @@ export default function App() {
         }
       } else {
         const file = files[0];
-        const prevFileId = video?.fileId;
-        const prevJobId = job?.jobId;
-        const formData = new FormData();
-        if (prevFileId) formData.append('previousFileId', prevFileId);
-        if (prevJobId) formData.append('previousJobId', prevJobId);
-        formData.append('fingerprint', fp);
-        formData.append('video', file);
+        let data: UploadedVideo;
 
-        const res = await fetch('/api/upload', {
-          method: 'POST',
-          headers: { 'x-browser-fingerprint': fp },
-          body: formData,
-        });
-        const data: UploadedVideo = await res.json();
-        if (!res.ok) throw new Error((data as any).error || 'Upload failed');
+        if (systemInfo?.available) {
+          try {
+            const prevFileId = video?.fileId;
+            const prevJobId = job?.jobId;
+            const formData = new FormData();
+            if (prevFileId) formData.append('previousFileId', prevFileId);
+            if (prevJobId) formData.append('previousJobId', prevJobId);
+            formData.append('fingerprint', fp);
+            formData.append('video', file);
+
+            const res = await fetch('/api/upload', {
+              method: 'POST',
+              headers: { 'x-browser-fingerprint': fp },
+              body: formData,
+            });
+            const json = await res.json();
+            if (!res.ok) throw new Error((json as any).error || 'Upload failed');
+            data = json;
+          } catch {
+            data = await probeVideoFileInBrowser(file);
+          }
+        } else {
+          // 100% Browser Client-Side Mode (Vercel)
+          data = await probeVideoFileInBrowser(file);
+        }
+
         setVideo(data);
         setClipQueue([data]);
         setPlayheadTime(0);
-
-        if (data.metadata.width && data.metadata.height) {
-          const isSourcePortrait = data.metadata.height > data.metadata.width;
-          const vrInfo = data.metadata.vr360;
-          const detectedProj =
-            vrInfo?.projection === 'hequirectangular'
-              ? 'hequirect'
-              : vrInfo?.projection === 'cubemap'
-              ? 'cubemap'
-              : vrInfo?.projection === 'fisheye'
-              ? 'fisheye'
-              : 'e';
-          const detectedStereo = vrInfo?.stereoMode || 'mono';
-
-          setConfig((prev) => {
-            const isTargetPortrait = prev.height > prev.width;
-            return {
-              ...prev,
-              rotation: 0,
-              watermarkBoxes: [],
-              vrNormalizeEnabled: Boolean(vrInfo?.isVr360),
-              vrInputProjection: detectedProj,
-              vrStereoMode: detectedStereo,
-              vrYaw: 0,
-              vrPitch: 0,
-              vrRoll: 0,
-              width: isSourcePortrait !== isTargetPortrait ? prev.height : prev.width,
-              height: isSourcePortrait !== isTargetPortrait ? prev.width : prev.height,
-            };
-          });
-
-          if (vrInfo?.isVr360) {
-            setActiveTab('cleanup');
-          }
-        }
+        applyDetectedVideoConfig(data);
       }
 
       if (fileInputRef.current) fileInputRef.current.value = '';
       if (addClipsInputRef.current) addClipsInputRef.current.value = '';
     } catch (err: any) {
-      setUploadError(err.message || 'Failed to upload video(s)');
+      setUploadError(err.message || 'Failed to load video(s)');
     } finally {
       setIsUploading(false);
     }
@@ -556,50 +624,114 @@ export default function App() {
   const handleMergeWithTransitions = async () => {
     if (clipQueue.length < 2) return;
     setUploadError(null);
+    const totalDur = clipQueue.reduce((s, c) => s + (c.metadata.duration || 0), 0);
 
     try {
-      const fp = fingerprint || (await getBrowserFingerprint());
-      const res = await fetch('/api/merge-transitions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-browser-fingerprint': fp,
-        },
-        body: JSON.stringify({
-          fingerprint: fp,
-          fileIds: clipQueue.map((c) => c.fileId),
-          transition: transitionType,
-          transitionDuration,
-          width: effectiveOutW,
-          height: effectiveOutH,
-          fps: config.fps === 'source' ? 30 : Number(config.fps) || 30,
-          codec: config.codec,
-          crf: config.crf,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to start transition merge');
+      const allServerFiles =
+        systemInfo?.available && clipQueue.every((c) => !c.fileId.startsWith('browser_'));
 
-      const totalDur = clipQueue.reduce((s, c) => s + (c.metadata.duration || 0), 0);
+      if (allServerFiles) {
+        const fp = fingerprint || (await getBrowserFingerprint());
+        const res = await fetch('/api/merge-transitions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-browser-fingerprint': fp,
+          },
+          body: JSON.stringify({
+            fingerprint: fp,
+            fileIds: clipQueue.map((c) => c.fileId),
+            transition: transitionType,
+            transitionDuration,
+            width: effectiveOutW,
+            height: effectiveOutH,
+            fps: config.fps === 'source' ? 30 : Number(config.fps) || 30,
+            codec: config.codec,
+            crf: config.crf,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to start transition merge');
+
+        setJob({
+          jobId: data.jobId,
+          status: 'processing',
+          progress: 0,
+          fps: 0,
+          speed: '0x',
+          bitrate: '',
+          currentTimeSec: 0,
+          totalDurationSec: Math.max(1, totalDur),
+          command: data.command,
+          startedAt: Date.now(),
+          completedAt: null,
+          outputUrl: null,
+          outputFilename: '',
+          outputMetadata: null,
+          error: null,
+          logs: [],
+        });
+        return;
+      }
+
+      // Browser FFmpeg WASM multi-clip merge fallback (Vercel / static hosting)
+      const browserJobId = `browser_merge_${Date.now()}`;
+      const startedAt = Date.now();
       setJob({
-        jobId: data.jobId,
+        jobId: browserJobId,
         status: 'processing',
-        progress: 0,
+        progress: 2,
         fps: 0,
-        speed: '0x',
+        speed: 'WASM',
         bitrate: '',
         currentTimeSec: 0,
         totalDurationSec: Math.max(1, totalDur),
-        command: data.command,
-        startedAt: Date.now(),
+        command: `ffmpeg (Browser WASM) xfade=${transitionType}:${transitionDuration}s`,
+        startedAt,
         completedAt: null,
         outputUrl: null,
         outputFilename: '',
         outputMetadata: null,
         error: null,
-        logs: [],
+        logs: ['Initializing @ffmpeg/ffmpeg WebAssembly core in browser...'],
       });
+
+      const result = await mergeClipsWithTransitionsInBrowser(
+        clipQueue,
+        {
+          transition: transitionType,
+          transitionDuration,
+          width: effectiveOutW,
+          height: effectiveOutH,
+          fps: config.fps === 'source' ? 30 : Number(config.fps) || 30,
+          crf: config.crf,
+        },
+        (partial) => {
+          setJob((prev) => (prev && prev.jobId === browserJobId ? { ...prev, ...partial } : prev));
+        }
+      );
+
+      setJob((prev) =>
+        prev && prev.jobId === browserJobId
+          ? {
+              ...prev,
+              status: 'completed',
+              progress: 100,
+              currentTimeSec: totalDur,
+              completedAt: Date.now(),
+              outputUrl: result.outputUrl,
+              outputFilename: result.outputFilename,
+              outputMetadata: result.outputMetadata,
+              command: result.command,
+            }
+          : prev
+      );
     } catch (err: any) {
+      setJob((prev) =>
+        prev && prev.jobId.startsWith('browser_')
+          ? { ...prev, status: 'failed', error: err.message || 'Browser merge failed' }
+          : prev
+      );
       setUploadError(err.message || 'Merge with transitions failed');
     }
   };
@@ -632,14 +764,19 @@ export default function App() {
     setIsDetectingWatermark(true);
     setUploadError(null);
     try {
-      const res = await fetch('/api/detect-watermark', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileId: video.fileId }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Watermark scan failed');
-      const boxes: WatermarkBox[] = data.boxes || [];
+      let boxes: WatermarkBox[] = [];
+      if (systemInfo?.available && !video.fileId.startsWith('browser_')) {
+        const res = await fetch('/api/detect-watermark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fileId: video.fileId }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Watermark scan failed');
+        boxes = data.boxes || [];
+      } else {
+        boxes = await detectWatermarksInBrowser(video.url, video.metadata.duration);
+      }
       setConfig((prev) => ({
         ...prev,
         watermarkEnabled: true,
@@ -659,21 +796,31 @@ export default function App() {
     const prevJobId = job?.jobId;
     setJob(null);
     try {
-      const fp = fingerprint || (await getBrowserFingerprint());
-      const res = await fetch('/api/generate-sample', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-browser-fingerprint': fp,
-        },
-        body: JSON.stringify({
-          fingerprint: fp,
-          previousFileId: prevFileId,
-          previousJobId: prevJobId,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to generate sample video');
+      let data: UploadedVideo;
+      if (systemInfo?.available) {
+        try {
+          const fp = fingerprint || (await getBrowserFingerprint());
+          const res = await fetch('/api/generate-sample', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-browser-fingerprint': fp,
+            },
+            body: JSON.stringify({
+              fingerprint: fp,
+              previousFileId: prevFileId,
+              previousJobId: prevJobId,
+            }),
+          });
+          const json = await res.json();
+          if (!res.ok) throw new Error(json.error || 'Failed to generate sample video');
+          data = json;
+        } catch {
+          data = await generateDemoVideoInBrowser();
+        }
+      } else {
+        data = await generateDemoVideoInBrowser();
+      }
       setVideo(data);
       setClipQueue([data]);
       setPlayheadTime(0);
@@ -689,47 +836,103 @@ export default function App() {
     setUploadError(null);
 
     try {
-      const fp = fingerprint || (await getBrowserFingerprint());
-      const res = await fetch('/api/process', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-browser-fingerprint': fp,
-        },
-        body: JSON.stringify({
-          fingerprint: fp,
-          fileId: video.fileId,
-          config,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to start FFmpeg job');
+      if (systemInfo?.available && !video.fileId.startsWith('browser_')) {
+        const fp = fingerprint || (await getBrowserFingerprint());
+        const res = await fetch('/api/process', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-browser-fingerprint': fp,
+          },
+          body: JSON.stringify({
+            fingerprint: fp,
+            fileId: video.fileId,
+            config,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to start FFmpeg job');
+
+        setJob({
+          jobId: data.jobId,
+          status: 'processing',
+          progress: 0,
+          fps: 0,
+          speed: '0x',
+          bitrate: '',
+          currentTimeSec: 0,
+          totalDurationSec: video.metadata.duration || 1,
+          command: data.command,
+          startedAt: Date.now(),
+          completedAt: null,
+          outputUrl: null,
+          outputFilename: '',
+          outputMetadata: null,
+          error: null,
+          logs: [],
+        });
+        return;
+      }
+
+      // 100% Client-Side Browser FFmpeg WASM Render (Vercel / Static Hosting)
+      const browserJobId = `browser_render_${Date.now()}`;
+      const startedAt = Date.now();
+      const previewCmd = buildBrowserCliCommand(video.originalName, config, video.metadata);
 
       setJob({
-        jobId: data.jobId,
+        jobId: browserJobId,
         status: 'processing',
-        progress: 0,
+        progress: 1,
         fps: 0,
-        speed: '0x',
+        speed: 'WASM',
         bitrate: '',
         currentTimeSec: 0,
         totalDurationSec: video.metadata.duration || 1,
-        command: data.command,
-        startedAt: Date.now(),
+        command: previewCmd,
+        startedAt,
         completedAt: null,
         outputUrl: null,
         outputFilename: '',
         outputMetadata: null,
         error: null,
-        logs: [],
+        logs: ['Loading @ffmpeg/ffmpeg WebAssembly engine in browser...'],
       });
+
+      const result = await processVideoInBrowser(video, config, (partial) => {
+        setJob((prev) => (prev && prev.jobId === browserJobId ? { ...prev, ...partial } : prev));
+      });
+
+      setJob((prev) =>
+        prev && prev.jobId === browserJobId
+          ? {
+              ...prev,
+              status: 'completed',
+              progress: 100,
+              currentTimeSec: video.metadata.duration || 1,
+              completedAt: Date.now(),
+              outputUrl: result.outputUrl,
+              outputFilename: result.outputFilename,
+              outputMetadata: result.outputMetadata,
+              command: result.command,
+            }
+          : prev
+      );
     } catch (err: any) {
+      setJob((prev) =>
+        prev && prev.jobId.startsWith('browser_')
+          ? { ...prev, status: 'failed', error: err.message || 'Browser FFmpeg render failed' }
+          : prev
+      );
       setUploadError(err.message);
     }
   };
 
   const handleCancelJob = async () => {
     if (!job) return;
+    if (job.jobId.startsWith('browser_')) {
+      setJob((prev) => (prev ? { ...prev, status: 'cancelled' } : null));
+      return;
+    }
     await fetch(`/api/jobs/${job.jobId}/cancel`, { method: 'POST' });
   };
 
@@ -893,7 +1096,7 @@ export default function App() {
             </div>
           )}
 
-          {systemInfo?.available && (
+          {systemInfo?.available ? (
             <div
               className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[11px]"
               title={systemInfo.version}
@@ -901,7 +1104,15 @@ export default function App() {
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
               <span>FFmpeg Ready</span>
             </div>
-          )}
+          ) : systemInfo ? (
+            <div
+              className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 text-[11px]"
+              title="Running 100% client-side in your browser via @ffmpeg/ffmpeg WebAssembly"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
+              <span>Browser WASM Ready</span>
+            </div>
+          ) : null}
         </div>
       </header>
 
