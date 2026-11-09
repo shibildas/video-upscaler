@@ -1,0 +1,23 @@
+name: Trigger Vercel Deploy Hook
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  trigger-vercel-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Vercel Deploy Hook
+        env:
+          DEPLOY_HOOK: ${{ secrets.DEPLOY_HOOK }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "Error: DEPLOY_HOOK secret is not set in GitHub repository secrets."
+            exit 1
+          fi
+          curl -f -s -S -X POST "$DEPLOY_HOOK"
+          echo ""
+          echo "Triggered Vercel Deploy Hook for branch: ${GITHUB_REF_NAME}"
